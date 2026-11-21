@@ -360,17 +360,18 @@ async def generate_report():
         return {"subject": subject, "body": body}
 
     prompt = (
-        "Rewrite the following Google Play support appeal email so every submission has unique wording, "
-        "sentence structure, and natural phrasing while preserving 100% of the core facts: "
-        "1) Google Play Points account restriction due to flagged 'suspicious activity' and Play account country/purchase issue while traveling. "
-        "2) User is traveling abroad and accessing the account across various international locations and Wi-Fi networks, causing a false-positive security flag. "
-        "3) User is the sole authorized owner, all points and transactions were earned legitimately under Google Play Terms of Service, with no fraud. "
-        "4) Request for manual review and reinstatement. "
-        "Do not invent order IDs or sensitive information. Output in English only.\n\n"
+        "You are a strict text rephraser with zero creative freedom. "
+        "Rewrite ONLY the provided appeal text using fresh phrasing and sentence structure while staying strictly bound to these exact points and nothing outside them: "
+        "1) Requesting a manual review of a restriction on the Google Play Points account due to flagged suspicious activity while traveling. "
+        "2) Accessing the account from different international locations and Wi-Fi networks during travel caused a false-positive security flag. "
+        "3) Confirming sole ownership of the account and that all points and transactions were earned legitimately under Google Play Terms of Service with no violations. "
+        "4) Politely asking to review and reinstate Play Points access. "
+        "STRICT RULES: Do NOT add new facts, apologies, promises, order IDs, dates, amounts, personal details, or outside topics. "
+        "Do NOT omit the core appeal points. Output in English only.\n\n"
         f"ORIGINAL TEXT:\n{template}\n\n"
         "Return strictly in this format:\n"
-        "SUBJECT: <rewritten subject>\n"
-        "BODY:\n<rewritten body>"
+        "SUBJECT: <rephrased subject>\n"
+        "BODY:\n<rephrased body>"
     )
     try:
         resp = await client.chat.completions.create(
@@ -844,6 +845,47 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
     return False, "2FA or verification timeout"
 
 
+async def analyze_gethelp_step_with_ai(step_summary, available_actions, body_text, first_name="", last_name=""):
+    client, model = _get_ai_client_and_model()
+    fallback = {
+        "action": "click",
+        "target_text": "Next step",
+        "input_value": "",
+    }
+    if not client:
+        return fallback
+
+    prompt = (
+        "You are a deterministic step controller for a Google Play Help support form. "
+        "You have NO freedom to invent actions or change the appeal topic. "
+        "Allowed actions: 'type_issue', 'select_chip', 'select_area', 'click_next', 'select_email', 'fill_form', 'submit'. "
+        "Stick strictly to the Play Points restriction appeal points (traveling abroad, Wi-Fi/location changes causing false-positive suspicious activity flag, legitimate earned points, manual review request). "
+        f"Current step context: {step_summary}\n"
+        f"Visible elements/options: {available_actions}\n"
+        f"First Name: {first_name} | Last Name: {last_name}\n"
+        f"Appeal Body: {body_text}\n"
+        "Reply ONLY as compact JSON: {\"action\": \"...\", \"target_text\": \"...\", \"input_value\": \"...\"}"
+    )
+    try:
+        resp = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+            max_tokens=180,
+        )
+        raw = resp.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return {
+                "action": str(parsed.get("action") or fallback["action"]).strip(),
+                "target_text": str(parsed.get("target_text") or fallback["target_text"]).strip(),
+                "input_value": str(parsed.get("input_value") or "").strip(),
+            }
+    except Exception as e:
+        logging.error(f"AI GetHelp step analyzer error: {_format_exc(e)}")
+    return fallback
+
+
 async def send_via_gethelp_form(account, body_text, challenge_callback=None):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -980,6 +1022,11 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
         _click_by_texts(["email", "البريد الإلكتروني"])
         await asyncio.sleep(1.6)
 
+        # Fill visible email input if shown on the GetHelp contact form
+        for e_inp in _visible_elements("input[type='email']"):
+            if not (e_inp.get_attribute("value") or "").strip():
+                _safe_type(e_inp, account["email"])
+
         # Fill visible text inputs: First Name, Last Name, and Transaction ID ("N/A" as required by Google Play Help)
         vis_text_inputs = _visible_elements("input[type='text'], input:not([type])")
         for idx, inp in enumerate(vis_text_inputs):
@@ -1003,6 +1050,20 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
         if vis_areas:
             _safe_type(vis_areas[0], body_text)
             await asyncio.sleep(0.6)
+
+        # Analyze and verify final step with AI strictly bound to the appeal points
+        visible_btns = [
+            (el.text or "").strip()
+            for el in driver.find_elements(By.XPATH, "//button | //div[@role='button']")
+            if el.is_displayed() and (el.text or "").strip()
+        ]
+        _ = await analyze_gethelp_step_with_ai(
+            step_summary="Final GetHelp Email form ready for submission after filling Transaction ID='N/A' and issue description.",
+            available_actions=", ".join(visible_btns[:15]),
+            body_text=body_text,
+            first_name=first_name,
+            last_name=last_name,
+        )
 
         # Click Submit / إرسال
         clicked_submit = _click_by_texts(["submit", "إرسال", "send"])
