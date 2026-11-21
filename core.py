@@ -1,3 +1,4 @@
+import subprocess
 import os
 import json
 import time
@@ -490,6 +491,11 @@ def _build_chrome_driver(account):
     )
     os.makedirs(prof_dir, exist_ok=True)
     _clean_stale_profile_locks(prof_dir)
+    try:
+        subprocess.run(["pkill", "-9", "-f", "chrome"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+        subprocess.run(["pkill", "-9", "-f", "chromedriver"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+    except Exception:
+        pass
 
     width, height = _parse_resolution(account.get("screen_res", "1080x2400"))
     if width > 600:
@@ -517,6 +523,17 @@ def _build_chrome_driver(account):
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-features=VizDisplayCompositor,IsolateOrigins,site-per-process")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-background-timer-throttling")
+    opts.add_argument("--disable-renderer-backgrounding")
+    opts.add_argument("--disable-backgrounding-occluded-windows")
+    opts.add_argument("--disable-breakpad")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-sync")
+    opts.add_argument("--metrics-recording-only")
+    opts.add_argument("--mute-audio")
+    opts.add_argument("--js-flags=--max-old-space-size=512")
     opts.add_argument("--remote-debugging-pipe")
     opts.add_argument("--headless=new")
     opts.add_argument(f"--window-size={width},{height}")
@@ -901,8 +918,23 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
 
         first_name, last_name = extract_and_save_profile_names(driver, account)
 
-        driver.get(f"{GETHELP_URL}?hl=en")
-        await asyncio.sleep(2.2)
+        try:
+            driver.get(f"{GETHELP_URL}?hl=en")
+            await asyncio.sleep(2.2)
+        except Exception as nav_err:
+            if "tab crashed" in str(nav_err).lower():
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = _build_chrome_driver(account)
+                ok_r, msg_r = await _interactive_google_login(driver, account, challenge_callback)
+                if not ok_r:
+                    return False, msg_r
+                driver.get(f"{GETHELP_URL}?hl=en")
+                await asyncio.sleep(2.2)
+            else:
+                raise
 
         def _safe_click(el):
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
