@@ -591,9 +591,12 @@ def extract_and_save_profile_names(driver, account):
     first_name = (account.get("first_name") or "").strip()
     last_name = (account.get("last_name") or "").strip()
 
+    if first_name and last_name and first_name != "Play":
+        return first_name, last_name
+
     try:
         driver.get("https://myaccount.google.com/profile/name?hl=en")
-        time.sleep(3)
+        time.sleep(1.2)
         inputs = driver.find_elements("css selector", "input[type='text']")
         vals = [i.get_attribute("value").strip() for i in inputs if i.get_attribute("value")]
         if len(vals) >= 2:
@@ -605,20 +608,6 @@ def extract_and_save_profile_names(driver, account):
             first_name, last_name = p[0], p[1]
             update_account(account["email"], first_name=first_name, last_name=last_name)
             return first_name, last_name
-    except Exception:
-        pass
-
-    try:
-        driver.get("https://myaccount.google.com/?hl=en")
-        time.sleep(3)
-        headings = driver.find_elements("css selector", "h1, [role='heading']")
-        for h in headings:
-            txt = (h.text or "").strip()
-            if txt and "@" not in txt and len(txt.split()) >= 2 and len(txt) < 60:
-                p = txt.split(None, 1)
-                first_name, last_name = p[0], p[1]
-                update_account(account["email"], first_name=first_name, last_name=last_name)
-                return first_name, last_name
     except Exception:
         pass
 
@@ -637,8 +626,13 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
     from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
 
+    try:
+        driver.set_page_load_timeout(20)
+    except Exception:
+        pass
+
     driver.get("https://myaccount.google.com/?hl=en")
-    await asyncio.sleep(4)
+    await asyncio.sleep(1.2)
 
     if "myaccount.google.com" in driver.current_url and "signin" not in driver.current_url:
         extract_and_save_profile_names(driver, account)
@@ -651,13 +645,13 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
 
     driver.get("https://accounts.google.com/signin/v2/identifier?hl=en")
     try:
-        email_input = WebDriverWait(driver, 20).until(
+        email_input = WebDriverWait(driver, 10).until(
             EC.presence_of_element_located((By.ID, "identifierId"))
         )
         email_input.clear()
         email_input.send_keys(account["email"])
         email_input.send_keys(Keys.ENTER)
-        await asyncio.sleep(3)
+        await asyncio.sleep(1.2)
     except Exception as e:
         return False, f"Failed to enter email: {e}"
 
@@ -679,12 +673,12 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
             cap_box = driver.find_element(By.CSS_SELECTOR, "input[type='text']")
             cap_box.send_keys(code)
             cap_box.send_keys(Keys.ENTER)
-            await asyncio.sleep(3)
+            await asyncio.sleep(1.2)
         except Exception:
             pass
 
     try:
-        pwd_input = WebDriverWait(driver, 15).until(
+        pwd_input = WebDriverWait(driver, 8).until(
             EC.presence_of_element_located((By.NAME, "Passwd"))
         )
         pwd_to_use = (account.get("password") or "").strip()
@@ -703,46 +697,66 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         pwd_input.clear()
         pwd_input.send_keys(pwd_to_use)
         pwd_input.send_keys(Keys.ENTER)
-        await asyncio.sleep(4)
+        await asyncio.sleep(1.5)
     except Exception:
         pass
 
     notified_2fa = False
+    challenge_task = None
     start = time.time()
     while time.time() - start < timeout:
         if _is_insecure_browser_block(driver):
+            if challenge_task and not challenge_task.done():
+                challenge_task.cancel()
             update_account(account["email"], last_status="Blocked: Browser/IP not trusted by Google")
             return False, "Google blocked sign-in ('This browser or app may not be secure')."
 
-        cur = driver.current_url
-        if "myaccount.google.com" in cur or "mail.google.com" in cur or "support.google.com" in cur:
-            if "signin" not in cur and "challenge" not in cur:
-                extract_and_save_profile_names(driver, account)
-                update_account(account["email"], logged_in=True, last_status="Logged in and session saved")
-                return True, "Logged in successfully"
+        cur = driver.current_url or ""
+        # Once approved on phone/2FA prompt, Google redirects away from challenge/signin automatically
+        if (
+            ("myaccount.google.com" in cur or "mail.google.com" in cur or "support.google.com" in cur)
+            and "signin" not in cur
+            and "challenge" not in cur
+        ):
+            if challenge_task and not challenge_task.done():
+                challenge_task.cancel()
+            extract_and_save_profile_names(driver, account)
+            update_account(account["email"], logged_in=True, last_status="Logged in and session saved")
+            return True, "Logged in successfully"
 
         if "challenge" in cur and not notified_2fa and challenge_callback:
             notified_2fa = True
             shot = _capture_screenshot(driver, account["email"])
-            user_reply = await challenge_callback(
-                account["email"],
-                "2fa",
-                shot,
-                "Verification code / 2FA required: send the code from your email/phone or approve and tap Done:",
+            challenge_task = asyncio.create_task(
+                challenge_callback(
+                    account["email"],
+                    "2fa",
+                    shot,
+                    "Tap the matching number on your phone to approve (auto-continues immediately, no click needed) or send code:",
+                )
             )
-            if user_reply and user_reply.lower() == "/cancel":
+
+        if challenge_task and challenge_task.done():
+            try:
+                user_reply = challenge_task.result()
+            except Exception:
+                user_reply = None
+            challenge_task = None
+            if user_reply and str(user_reply).strip().lower() == "/cancel":
                 return False, "2FA cancelled"
-            if user_reply and user_reply.lower() not in ("done", "ok"):
+            if user_reply and str(user_reply).strip().lower() not in ("done", "ok", ""):
                 try:
                     code_input = driver.find_element(By.CSS_SELECTOR, "input[type='tel'], input[type='text'], input[type='number']")
                     code_input.clear()
-                    code_input.send_keys(user_reply.strip())
+                    code_input.send_keys(str(user_reply).strip())
                     code_input.send_keys(Keys.ENTER)
                 except Exception:
                     pass
 
-        await asyncio.sleep(3)
+        await asyncio.sleep(0.6)
 
+    if challenge_task and not challenge_task.done():
+        challenge_task.cancel()
     return False, "2FA or verification timeout"
 
 
@@ -762,68 +776,127 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
         first_name, last_name = extract_and_save_profile_names(driver, account)
 
         driver.get(f"{GETHELP_URL}?hl=en")
-        await asyncio.sleep(4)
+        await asyncio.sleep(1.5)
+
+        def _safe_click(el):
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+            time.sleep(0.1)
+            try:
+                el.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", el)
+
+        def _safe_type(el, val):
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+            time.sleep(0.1)
+            try:
+                el.click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", el)
+            try:
+                el.clear()
+            except Exception:
+                pass
+            try:
+                el.send_keys(val)
+            except Exception:
+                driver.execute_script(
+                    "arguments[0].value = arguments[1];"
+                    "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
+                    "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+                    el,
+                    val,
+                )
+
+        def _visible_elements(css_sel):
+            out = []
+            for el in driver.find_elements(By.CSS_SELECTOR, css_sel):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        out.append(el)
+                except Exception:
+                    pass
+            return out
 
         try:
-            step1_input = WebDriverWait(driver, 20).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='text'], textarea"))
+            vis_inputs = WebDriverWait(driver, 10).until(
+                lambda d: [
+                    el for el in d.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type]), textarea")
+                    if el.is_displayed() and el.is_enabled()
+                ]
             )
-            step1_input.clear()
-            step1_input.send_keys("Play point issues")
-            await asyncio.sleep(1)
-            next_btn = driver.find_element(By.XPATH, "//button[contains(., 'Next')]")
-            next_btn.click()
-            await asyncio.sleep(3)
+            _safe_type(vis_inputs[0], "Play point issues")
+            await asyncio.sleep(0.4)
+            next_btns = [
+                b for b in driver.find_elements(By.XPATH, "//button[contains(., 'Next')]")
+                if b.is_displayed() and b.is_enabled()
+            ]
+            if next_btns:
+                _safe_click(next_btns[0])
+                await asyncio.sleep(1.0)
         except Exception:
             pass
 
         try:
-            chip = WebDriverWait(driver, 12).until(
-                EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Play Points issue')]"))
+            chips = WebDriverWait(driver, 6).until(
+                lambda d: [
+                    c for c in d.find_elements(By.XPATH, "//*[contains(text(), 'Play Points issue')]")
+                    if c.is_displayed()
+                ]
             )
-            chip.click()
-            await asyncio.sleep(2)
+            _safe_click(chips[0])
+            await asyncio.sleep(0.8)
         except Exception:
             pass
 
         for _ in range(3):
             try:
-                ns = driver.find_element(By.XPATH, "//button[contains(., 'Next step')]")
-                ns.click()
-                await asyncio.sleep(2)
+                ns_list = [
+                    b for b in driver.find_elements(By.XPATH, "//button[contains(., 'Next step')]")
+                    if b.is_displayed() and b.is_enabled()
+                ]
+                if not ns_list:
+                    break
+                _safe_click(ns_list[0])
+                await asyncio.sleep(0.8)
             except Exception:
                 break
 
         try:
-            email_opt = WebDriverWait(driver, 12).until(
-                EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Email')]"))
+            email_opts = WebDriverWait(driver, 6).until(
+                lambda d: [
+                    e for e in d.find_elements(By.XPATH, "//*[contains(text(), 'Email')]")
+                    if e.is_displayed()
+                ]
             )
-            email_opt.click()
-            await asyncio.sleep(3)
+            _safe_click(email_opts[0])
+            await asyncio.sleep(1.0)
         except Exception:
             pass
 
-        text_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='text']")
-        if len(text_inputs) >= 3:
-            text_inputs[0].clear()
-            text_inputs[0].send_keys(first_name)
-            text_inputs[1].clear()
-            text_inputs[1].send_keys(last_name)
-            text_inputs[2].clear()
-            text_inputs[2].send_keys("N/A")
+        vis_text_inputs = _visible_elements("input[type='text'], input:not([type])")
+        if len(vis_text_inputs) >= 3:
+            _safe_type(vis_text_inputs[0], first_name)
+            _safe_type(vis_text_inputs[1], last_name)
+            _safe_type(vis_text_inputs[2], "N/A")
 
-        issue_area = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "textarea"))
+        vis_areas = WebDriverWait(driver, 10).until(
+            lambda d: [
+                t for t in d.find_elements(By.CSS_SELECTOR, "textarea")
+                if t.is_displayed() and t.is_enabled()
+            ]
         )
-        issue_area.clear()
-        issue_area.send_keys(body_text)
-        await asyncio.sleep(1)
+        _safe_type(vis_areas[0], body_text)
+        await asyncio.sleep(0.4)
 
-        submit_btn = WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Submit')]"))
+        submit_btns = WebDriverWait(driver, 8).until(
+            lambda d: [
+                b for b in d.find_elements(By.XPATH, "//button[contains(., 'Submit')]")
+                if b.is_displayed() and b.is_enabled()
+            ]
         )
-        submit_btn.click()
-        await asyncio.sleep(4)
+        _safe_click(submit_btns[0])
+        await asyncio.sleep(1.5)
         return True, "Submitted via Google Play GetHelp"
     except Exception as e:
         logging.error(f"GetHelp form error: {e}")
@@ -856,13 +929,13 @@ async def send_via_gmail_web(account, to_email, subject, body, challenge_callbac
             EC.element_to_be_clickable((By.XPATH, "//div[text()='Compose']"))
         )
         compose.click()
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.8)
 
         driver.find_element(By.CSS_SELECTOR, "input[aria-label*='To'], input[peoplekit-id]").send_keys(to_email)
         driver.find_element(By.NAME, "subjectbox").send_keys(subject)
         driver.find_element(By.CSS_SELECTOR, "div[aria-label='Message Body']").send_keys(body)
         driver.find_element(By.XPATH, "//div[text()='Send']").click()
-        await asyncio.sleep(4)
+        await asyncio.sleep(1.5)
         return True, "Sent via Gmail Web"
     except Exception as e:
         logging.error(f"Gmail web error: {e}")
