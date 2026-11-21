@@ -89,6 +89,16 @@ REAL_DEVICES_POOL = [
 ]
 
 
+def _format_exc(exc):
+    raw = (str(exc) or "").strip()
+    if "Stacktrace:" in raw:
+        raw = raw.split("Stacktrace:", 1)[0].strip()
+    raw = raw.replace("Message:", "", 1).strip() if raw.startswith("Message:") else raw
+    if not raw:
+        return f"{type(exc).__name__}"
+    return f"{type(exc).__name__}: {raw}" if not raw.startswith(type(exc).__name__) else raw
+
+
 def _get_ai_client_and_model():
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -297,7 +307,7 @@ async def generate_ai_device_identity():
                 item[k] = str(data[k]).strip()
         return item
     except Exception as e:
-        logging.error(f"AI device identity error: {e}")
+        logging.error(f"AI device identity error: {_format_exc(e)}")
         return item
 
 
@@ -381,7 +391,7 @@ async def generate_report():
                 break
         return {"subject": subject, "body": body}
     except Exception as e:
-        logging.error(f"AI report generation failed: {e}")
+        logging.error(f"AI report generation failed: {_format_exc(e)}")
         parts = template.split("\n", 1)
         subject = parts[0].replace("Subject:", "").strip()
         body = parts[1].strip() if len(parts) > 1 else template
@@ -403,8 +413,9 @@ def send_via_smtp(account, to_email, subject, body):
             server.send_message(msg)
         return True, "Sent successfully via SMTP"
     except Exception as e:
-        logging.error(f"SMTP error: {e}")
-        return False, str(e)
+        err = _format_exc(e)
+        logging.error(f"SMTP error: {err}")
+        return False, err
 
 
 def test_smtp(account):
@@ -413,7 +424,7 @@ def test_smtp(account):
             server.login(account["email"], account["app_password"])
         return True, "SMTP connection OK"
     except Exception as e:
-        return False, str(e)
+        return False, _format_exc(e)
 
 
 def _resolve_chrome_binary():
@@ -549,10 +560,14 @@ def _build_chrome_driver(account):
 
 def _capture_screenshot(driver, email):
     _ensure_storage()
+    time.sleep(0.5)
     fname = f"{email.replace('@', '_')}_{int(time.time())}.png"
     path = os.path.join(SCREENSHOTS_DIR, fname)
-    driver.save_screenshot(path)
-    return path
+    try:
+        driver.save_screenshot(path)
+        return path
+    except Exception:
+        return None
 
 
 def _is_insecure_browser_block(driver):
@@ -573,18 +588,69 @@ def _has_real_captcha_challenge(driver):
 
         if _is_insecure_browser_block(driver):
             return False
+
+        pwd_boxes = [
+            p for p in driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='Passwd']")
+            if p.is_displayed()
+        ]
+        if pwd_boxes:
+            return False
+
+        page_txt = ((driver.title or "") + " " + (driver.page_source or "")).lower()
+        if "enter your password" in page_txt or "show password" in page_txt:
+            return False
+
         cur = (driver.current_url or "").lower()
         if "recaptcha" in cur or "captcha" in cur:
             return True
-        frames = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='recaptcha'], iframe[title*='recaptcha'], iframe[src*='captcha']")
+
+        frames = [
+            fr for fr in driver.find_elements(
+                By.CSS_SELECTOR,
+                "iframe[src*='recaptcha'], iframe[title*='recaptcha' i], iframe[src*='captcha']",
+            )
+            if fr.is_displayed()
+        ]
         if frames:
             return True
-        imgs = driver.find_elements(By.CSS_SELECTOR, "img[src*='captcha'], img[alt*='captcha' i]")
+
+        imgs = [
+            im for im in driver.find_elements(
+                By.CSS_SELECTOR,
+                "img[src*='captcha'], img[alt*='captcha' i], img[src*='challenge']",
+            )
+            if im.is_displayed()
+        ]
         if imgs:
             return True
+
         return False
     except Exception:
         return False
+
+
+def _click_next_if_present(driver):
+    try:
+        from selenium.webdriver.common.by import By
+        btns = [
+            b for b in driver.find_elements(
+                By.XPATH,
+                "//button[contains(., 'Next') or contains(., 'next') or @id='identifierNext' or @id='passwordNext'] | "
+                "//div[@role='button'][contains(., 'Next')]",
+            )
+            if b.is_displayed() and b.is_enabled()
+        ]
+        if btns:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btns[0])
+            time.sleep(0.15)
+            try:
+                btns[0].click()
+            except Exception:
+                driver.execute_script("arguments[0].click();", btns[0])
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def extract_and_save_profile_names(driver, account):
@@ -596,7 +662,7 @@ def extract_and_save_profile_names(driver, account):
 
     try:
         driver.get("https://myaccount.google.com/profile/name?hl=en")
-        time.sleep(1.2)
+        time.sleep(1.5)
         inputs = driver.find_elements("css selector", "input[type='text']")
         vals = [i.get_attribute("value").strip() for i in inputs if i.get_attribute("value")]
         if len(vals) >= 2:
@@ -627,12 +693,12 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
     from selenium.webdriver.support import expected_conditions as EC
 
     try:
-        driver.set_page_load_timeout(20)
+        driver.set_page_load_timeout(25)
     except Exception:
         pass
 
     driver.get("https://myaccount.google.com/?hl=en")
-    await asyncio.sleep(1.2)
+    await asyncio.sleep(1.8)
 
     if "myaccount.google.com" in driver.current_url and "signin" not in driver.current_url:
         extract_and_save_profile_names(driver, account)
@@ -645,15 +711,18 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
 
     driver.get("https://accounts.google.com/signin/v2/identifier?hl=en")
     try:
-        email_input = WebDriverWait(driver, 10).until(
+        email_input = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.ID, "identifierId"))
         )
         email_input.clear()
         email_input.send_keys(account["email"])
         email_input.send_keys(Keys.ENTER)
         await asyncio.sleep(1.2)
+        if "identifierId" in (driver.page_source or "") and len(driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='Passwd']")) == 0:
+            _click_next_if_present(driver)
+        await asyncio.sleep(1.8)
     except Exception as e:
-        return False, f"Failed to enter email: {e}"
+        return False, f"Failed to enter email: {_format_exc(e)}"
 
     if _is_insecure_browser_block(driver):
         update_account(account["email"], last_status="Blocked: Browser/IP not trusted by Google")
@@ -667,37 +736,50 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
             shot,
             "CAPTCHA challenge detected. Enter verification text/code or /cancel:",
         )
-        if not code or code.lower() == "/cancel":
+        if not code or str(code).strip().lower() == "/cancel":
             return False, "Cancelled by user"
         try:
             cap_box = driver.find_element(By.CSS_SELECTOR, "input[type='text']")
-            cap_box.send_keys(code)
+            cap_box.send_keys(str(code).strip())
             cap_box.send_keys(Keys.ENTER)
-            await asyncio.sleep(1.2)
+            await asyncio.sleep(1.8)
         except Exception:
             pass
 
     try:
-        pwd_input = WebDriverWait(driver, 8).until(
-            EC.presence_of_element_located((By.NAME, "Passwd"))
-        )
-        pwd_to_use = (account.get("password") or "").strip()
-        if not pwd_to_use and challenge_callback:
-            shot = _capture_screenshot(driver, account["email"])
-            reply = await challenge_callback(
-                account["email"],
-                "password",
-                shot,
-                "Enter the Google account password (or /cancel):",
+        pwd_input = WebDriverWait(driver, 12).until(
+            lambda d: next(
+                (
+                    el for el in d.find_elements(By.CSS_SELECTOR, "input[name='Passwd'], input[type='password']")
+                    if el.is_displayed() and el.is_enabled()
+                ),
+                None,
             )
-            if reply and reply.lower() != "/cancel" and reply.lower() not in ("done", "ok"):
-                pwd_to_use = reply.strip()
-        if not pwd_to_use:
-            return False, "Account password not provided"
-        pwd_input.clear()
-        pwd_input.send_keys(pwd_to_use)
-        pwd_input.send_keys(Keys.ENTER)
-        await asyncio.sleep(1.5)
+        )
+        if pwd_input:
+            pwd_to_use = (account.get("password") or "").strip()
+            if not pwd_to_use and challenge_callback:
+                shot = _capture_screenshot(driver, account["email"])
+                reply = await challenge_callback(
+                    account["email"],
+                    "password",
+                    shot,
+                    "Enter the Google account password (or /cancel):",
+                )
+                if reply and str(reply).strip().lower() != "/cancel" and str(reply).strip().lower() not in ("done", "ok"):
+                    pwd_to_use = str(reply).strip()
+            if not pwd_to_use:
+                return False, "Account password not provided"
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", pwd_input)
+            time.sleep(0.15)
+            pwd_input.click()
+            pwd_input.clear()
+            pwd_input.send_keys(pwd_to_use)
+            pwd_input.send_keys(Keys.ENTER)
+            await asyncio.sleep(1.0)
+            if driver.find_elements(By.CSS_SELECTOR, "input[name='Passwd'], input[type='password']"):
+                _click_next_if_present(driver)
+            await asyncio.sleep(1.8)
     except Exception:
         pass
 
@@ -712,7 +794,6 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
             return False, "Google blocked sign-in ('This browser or app may not be secure')."
 
         cur = driver.current_url or ""
-        # Once approved on phone/2FA prompt, Google redirects away from challenge/signin automatically
         if (
             ("myaccount.google.com" in cur or "mail.google.com" in cur or "support.google.com" in cur)
             and "signin" not in cur
@@ -720,11 +801,13 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         ):
             if challenge_task and not challenge_task.done():
                 challenge_task.cancel()
+            await asyncio.sleep(0.8)
             extract_and_save_profile_names(driver, account)
             update_account(account["email"], logged_in=True, last_status="Logged in and session saved")
             return True, "Logged in successfully"
 
         if "challenge" in cur and not notified_2fa and challenge_callback:
+            await asyncio.sleep(0.8)
             notified_2fa = True
             shot = _capture_screenshot(driver, account["email"])
             challenge_task = asyncio.create_task(
@@ -750,10 +833,11 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
                     code_input.clear()
                     code_input.send_keys(str(user_reply).strip())
                     code_input.send_keys(Keys.ENTER)
+                    await asyncio.sleep(1.5)
                 except Exception:
                     pass
 
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(0.7)
 
     if challenge_task and not challenge_task.done():
         challenge_task.cancel()
@@ -763,7 +847,6 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
 async def send_via_gethelp_form(account, body_text, challenge_callback=None):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
 
     account = await ensure_account_session_identity(account)
     driver = None
@@ -776,11 +859,11 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
         first_name, last_name = extract_and_save_profile_names(driver, account)
 
         driver.get(f"{GETHELP_URL}?hl=en")
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.2)
 
         def _safe_click(el):
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-            time.sleep(0.1)
+            time.sleep(0.2)
             try:
                 el.click()
             except Exception:
@@ -788,7 +871,7 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
 
         def _safe_type(el, val):
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-            time.sleep(0.1)
+            time.sleep(0.2)
             try:
                 el.click()
             except Exception:
@@ -810,12 +893,15 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
 
         def _visible_elements(css_sel):
             out = []
-            for el in driver.find_elements(By.CSS_SELECTOR, css_sel):
-                try:
-                    if el.is_displayed() and el.is_enabled():
-                        out.append(el)
-                except Exception:
-                    pass
+            try:
+                for el in driver.find_elements(By.CSS_SELECTOR, css_sel):
+                    try:
+                        if el.is_displayed() and el.is_enabled():
+                            out.append(el)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             return out
 
         try:
@@ -825,52 +911,60 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
                     if el.is_displayed() and el.is_enabled()
                 ]
             )
-            _safe_type(vis_inputs[0], "Play point issues")
-            await asyncio.sleep(0.4)
-            next_btns = [
-                b for b in driver.find_elements(By.XPATH, "//button[contains(., 'Next')]")
-                if b.is_displayed() and b.is_enabled()
-            ]
-            if next_btns:
-                _safe_click(next_btns[0])
-                await asyncio.sleep(1.0)
+            if vis_inputs:
+                _safe_type(vis_inputs[0], "Play point issues")
+                await asyncio.sleep(0.7)
+                next_btns = [
+                    b for b in driver.find_elements(By.XPATH, "//button[contains(., 'Next')]")
+                    if b.is_displayed() and b.is_enabled()
+                ]
+                if next_btns:
+                    _safe_click(next_btns[0])
+                    await asyncio.sleep(1.5)
         except Exception:
             pass
 
         try:
-            chips = WebDriverWait(driver, 6).until(
-                lambda d: [
-                    c for c in d.find_elements(By.XPATH, "//*[contains(text(), 'Play Points issue')]")
-                    if c.is_displayed()
-                ]
-            )
-            _safe_click(chips[0])
-            await asyncio.sleep(0.8)
+            chips = [
+                c for c in driver.find_elements(
+                    By.XPATH,
+                    "//*[contains(translate(text(), 'PLAY POINTS ISSUE', 'play points issue'), 'play points issue')]",
+                )
+                if c.is_displayed()
+            ]
+            if chips:
+                _safe_click(chips[0])
+                await asyncio.sleep(1.2)
         except Exception:
             pass
 
         for _ in range(3):
             try:
                 ns_list = [
-                    b for b in driver.find_elements(By.XPATH, "//button[contains(., 'Next step')]")
+                    b for b in driver.find_elements(
+                        By.XPATH,
+                        "//button[contains(translate(., 'NEXT STEP', 'next step'), 'next step')]",
+                    )
                     if b.is_displayed() and b.is_enabled()
                 ]
                 if not ns_list:
                     break
                 _safe_click(ns_list[0])
-                await asyncio.sleep(0.8)
+                await asyncio.sleep(1.2)
             except Exception:
                 break
 
         try:
-            email_opts = WebDriverWait(driver, 6).until(
-                lambda d: [
-                    e for e in d.find_elements(By.XPATH, "//*[contains(text(), 'Email')]")
-                    if e.is_displayed()
-                ]
-            )
-            _safe_click(email_opts[0])
-            await asyncio.sleep(1.0)
+            email_opts = [
+                e for e in driver.find_elements(
+                    By.XPATH,
+                    "//*[contains(translate(text(), 'EMAIL', 'email'), 'email')]",
+                )
+                if e.is_displayed()
+            ]
+            if email_opts:
+                _safe_click(email_opts[0])
+                await asyncio.sleep(1.5)
         except Exception:
             pass
 
@@ -880,27 +974,32 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
             _safe_type(vis_text_inputs[1], last_name)
             _safe_type(vis_text_inputs[2], "N/A")
 
-        vis_areas = WebDriverWait(driver, 10).until(
-            lambda d: [
-                t for t in d.find_elements(By.CSS_SELECTOR, "textarea")
-                if t.is_displayed() and t.is_enabled()
-            ]
-        )
+        vis_areas = _visible_elements("textarea")
+        if not vis_areas:
+            _capture_screenshot(driver, account["email"])
+            raise RuntimeError(
+                f"GetHelp textarea not found on {driver.current_url or GETHELP_URL} (title: {driver.title or 'N/A'})"
+            )
         _safe_type(vis_areas[0], body_text)
-        await asyncio.sleep(0.4)
+        await asyncio.sleep(0.7)
 
-        submit_btns = WebDriverWait(driver, 8).until(
-            lambda d: [
-                b for b in d.find_elements(By.XPATH, "//button[contains(., 'Submit')]")
-                if b.is_displayed() and b.is_enabled()
-            ]
-        )
+        submit_btns = [
+            b for b in driver.find_elements(
+                By.XPATH,
+                "//button[contains(translate(., 'SUBMIT', 'submit'), 'submit')]",
+            )
+            if b.is_displayed() and b.is_enabled()
+        ]
+        if not submit_btns:
+            _capture_screenshot(driver, account["email"])
+            raise RuntimeError(f"Submit button not found on {driver.current_url or GETHELP_URL}")
         _safe_click(submit_btns[0])
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.0)
         return True, "Submitted via Google Play GetHelp"
     except Exception as e:
-        logging.error(f"GetHelp form error: {e}")
-        return False, f"GetHelp form error: {e}"
+        err = _format_exc(e)
+        logging.error(f"GetHelp form error: {err}")
+        return False, f"GetHelp form error: {err}"
     finally:
         if driver:
             try:
@@ -923,23 +1022,24 @@ async def send_via_gmail_web(account, to_email, subject, body, challenge_callbac
             return False, msg
 
         driver.get("https://mail.google.com/mail/u/0/?hl=en")
-        await asyncio.sleep(5)
+        await asyncio.sleep(3.5)
 
         compose = WebDriverWait(driver, 25).until(
             EC.element_to_be_clickable((By.XPATH, "//div[text()='Compose']"))
         )
         compose.click()
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(1.2)
 
         driver.find_element(By.CSS_SELECTOR, "input[aria-label*='To'], input[peoplekit-id]").send_keys(to_email)
         driver.find_element(By.NAME, "subjectbox").send_keys(subject)
         driver.find_element(By.CSS_SELECTOR, "div[aria-label='Message Body']").send_keys(body)
         driver.find_element(By.XPATH, "//div[text()='Send']").click()
-        await asyncio.sleep(1.5)
+        await asyncio.sleep(2.0)
         return True, "Sent via Gmail Web"
     except Exception as e:
-        logging.error(f"Gmail web error: {e}")
-        return False, str(e)
+        err = _format_exc(e)
+        logging.error(f"Gmail web error: {err}")
+        return False, err
     finally:
         if driver:
             try:
@@ -960,7 +1060,14 @@ async def dispatch_report(account, subject, body, method="auto", challenge_callb
         return await send_via_gmail_web(account, target_email, subject, body, challenge_callback)
 
     if account.get("logged_in") or account.get("password"):
-        return await send_via_gethelp_form(account, body, challenge_callback)
+        ok, info = await send_via_gethelp_form(account, body, challenge_callback)
+        if ok:
+            return ok, info
+        if account.get("app_password"):
+            s_ok, s_info = send_via_smtp(account, target_email, subject, body)
+            if s_ok:
+                return s_ok, f"{s_info} (fallback after GetHelp: {info})"
+        return False, info
     if account.get("app_password"):
         return send_via_smtp(account, target_email, subject, body)
     return False, "No valid credentials for account"
