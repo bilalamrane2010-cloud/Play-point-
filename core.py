@@ -455,6 +455,16 @@ def _parse_resolution(res_str):
     return 412, 915
 
 
+def _clean_stale_profile_locks(prof_dir):
+    for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        lp = os.path.join(prof_dir, lock_name)
+        try:
+            if os.path.lexists(lp):
+                os.remove(lp)
+        except Exception:
+            pass
+
+
 def _build_chrome_driver(account):
     chrome_bin = _resolve_chrome_binary()
     if not chrome_bin:
@@ -467,6 +477,7 @@ def _build_chrome_driver(account):
         PROFILES_DIR, account["email"].replace("@", "_at_").replace(".", "_")
     )
     os.makedirs(prof_dir, exist_ok=True)
+    _clean_stale_profile_locks(prof_dir)
 
     width, height = _parse_resolution(account.get("screen_res", "1080x2400"))
     if width > 600:
@@ -482,45 +493,28 @@ def _build_chrome_driver(account):
     dev_id = account.get("device_id") or "DEV-000000"
     ip_addr = account.get("ip_address") or "105.104.22.14"
 
-    driver = None
-    try:
-        import undetected_chromedriver as uc
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
 
-        opts = uc.ChromeOptions()
-        opts.binary_location = chrome_bin
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--headless=new")
-        opts.add_argument(f"--window-size={width},{height}")
-        opts.add_argument(f"--lang={locale}")
-        opts.add_argument(f"--user-agent={ua}")
-        driver = uc.Chrome(
-            options=opts,
-            user_data_dir=prof_dir,
-            headless=True,
-            use_subprocess=True,
-        )
-    except Exception:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.service import Service
+    opts = webdriver.ChromeOptions()
+    opts.binary_location = chrome_bin
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+    opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--remote-debugging-pipe")
+    opts.add_argument("--headless=new")
+    opts.add_argument(f"--window-size={width},{height}")
+    opts.add_argument(f"--lang={locale}")
+    opts.add_argument(f"--user-agent={ua}")
+    opts.add_argument(f"--user-data-dir={prof_dir}")
+    opts.add_argument("--profile-directory=Default")
 
-        opts = webdriver.ChromeOptions()
-        opts.binary_location = chrome_bin
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--headless=new")
-        opts.add_argument(f"--window-size={width},{height}")
-        opts.add_argument(f"--lang={locale}")
-        opts.add_argument(f"--user-agent={ua}")
-        opts.add_argument(f"--user-data-dir={prof_dir}")
-        opts.add_argument("--profile-directory=Default")
-        driver_path = _resolve_chromedriver_path()
-        driver = webdriver.Chrome(service=Service(driver_path), options=opts)
+    driver_path = _resolve_chromedriver_path()
+    driver = webdriver.Chrome(service=Service(driver_path), options=opts)
 
     try:
         driver.execute_cdp_cmd(
