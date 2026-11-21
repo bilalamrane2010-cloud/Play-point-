@@ -35,7 +35,7 @@ def build_main_menu():
         ],
         [
             InlineKeyboardButton("👤 Accounts Manager", callback_data="menu_accounts"),
-            InlineKeyboardButton("📱 Device Identity", callback_data="menu_device"),
+            InlineKeyboardButton("📱 Device & IP Identity", callback_data="menu_device"),
         ],
         [
             InlineKeyboardButton(f"{auto_icon} Auto Send", callback_data="toggle_auto"),
@@ -66,10 +66,10 @@ def render_dashboard():
         "🛡️ **Control Panel — Google Play Support**\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         f"• **Accounts:** `{len(accounts)}` (Saved sessions: `{active_sessions}`)\n"
+        f"• **Auto Login on Add:** {'Enabled ✅' if s.get('auto_login_on_add', True) else 'Disabled ⏸️'}\n"
         f"• **Auto Send:** {'Enabled ✅' if s.get('auto_send_enabled') else 'Disabled ⏸️'}\n"
         f"• **Interval:** Every `{s.get('auto_send_interval', 60)}` min\n"
         f"• **Channel:** `{method_labels.get(s.get('send_method', 'web_form'), 'auto')}`\n"
-        f"• **Device Rotation:** Every `{s.get('rotate_hours', 1)}` hr (unlogged accounts)\n"
         f"• **Stats:** Success `{st.get('total_sent', 0)}` | Failed `{st.get('failed', 0)}`\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
@@ -253,7 +253,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "acc_add_choose_mode":
         kb = [
-            [InlineKeyboardButton("📧 Email + Verification Code (Web Form)", callback_data="acc_add_mode::email_code")],
+            [InlineKeyboardButton("📧 Email + Password (Auto Login)", callback_data="acc_add_mode::email_code")],
             [InlineKeyboardButton("🔑 Email + App Password (SMTP)", callback_data="acc_add_mode::app_password")],
             [InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")],
         ]
@@ -267,7 +267,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("acc_add_mode::"):
         mode = data.split("::", 1)[1]
         USER_STATES[chat_id] = {"step": "add_email", "auth_type": mode}
-        label = "Email + Code (Web Form)" if mode == "email_code" else "Email + App Password (SMTP)"
+        label = "Email + Password (Auto Login)" if mode == "email_code" else "Email + App Password (SMTP)"
         await q.edit_message_text(
             f"📧 Method: **{label}**\nSend **Gmail address** (Name & Surname are extracted automatically):",
             parse_mode="Markdown",
@@ -276,22 +276,43 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_device":
         accounts = core.load_accounts()
-        lines = ["📱 **Device Identities**"]
+        lines = ["📱 **Device & IP Identities**"]
         for a in accounts:
             lock = "🔒 Locked" if a.get("logged_in") else "🔄 Hourly Rotation"
             lines.append(
                 f"• `{a['email']}` [{lock}]\n"
-                f"  Device: `{a.get('device_name') or 'Pending'}` | ID: `{a.get('device_id') or 'Pending'}`"
+                f"  Phone: `{a.get('device_name') or 'Pending'}` | ID: `{a.get('device_id') or 'Pending'}`\n"
+                f"  IP: `{a.get('ip_address') or 'Auto'}` | TZ: `{a.get('timezone') or 'Africa/Algiers'}`"
             )
         if len(lines) == 1:
             lines.append("No accounts configured yet.")
         kb = [
             [InlineKeyboardButton("🎲 Rotate Unlogged Devices Now", callback_data="rotate_devices_now")],
+            [InlineKeyboardButton("✏️ Set Device / IP for Account", callback_data="set_dev_ip_select")],
             [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
         ]
         await q.edit_message_text(
             "\n".join(lines)[:3900],
             reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "set_dev_ip_select":
+        accounts = core.load_accounts()
+        if not accounts:
+            await q.edit_message_text("No accounts found.")
+            return
+        kb = [[InlineKeyboardButton(a["email"], callback_data=f"set_dev_ip_acc::{a['email']}")] for a in accounts]
+        kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_device")])
+        await q.edit_message_text("Select account to set Phone Name, Device ID & IP:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data.startswith("set_dev_ip_acc::"):
+        email = data.split("::", 1)[1]
+        USER_STATES[chat_id] = {"step": "set_dev_ip_val", "email": email}
+        await q.edit_message_text(
+            f"📱 Send for `{email}` in format:\n`Phone Name | Device ID | IP Address`\nExample:\n`Xiaomi Redmi Note 12 Pro 5G | 22101316I-001 | 105.104.22.14`",
             parse_mode="Markdown",
         )
         return
@@ -304,7 +325,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await core.ensure_account_session_identity(a, force_rotate=True)
                 rotated += 1
         await q.edit_message_text(
-            f"✅ Rotated device identity for `{rotated}` unlogged accounts.",
+            f"✅ Rotated device & IP identity for `{rotated}` unlogged accounts.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_device")]]),
             parse_mode="Markdown",
         )
@@ -321,12 +342,12 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         blocks = []
         for a in accounts:
             sess = "Saved 🔒" if a.get("logged_in") else "Not logged in"
-            mode_txt = "Email+Code" if a.get("auth_type", "email_code") == "email_code" else "App Password"
+            mode_txt = "Email+Pass" if a.get("auth_type", "email_code") == "email_code" else "App Password"
             blocks.append(
                 f"• `{a['email']}` — **{a.get('first_name', '')} {a.get('last_name', '')}** [{mode_txt}]\n"
-                f"  Session: {sess} | SMTP: {'✓' if a.get('app_password') else '✗'} | Pass: {'✓' if a.get('password') else '✗'}\n"
-                f"  Device: `{a.get('device_name') or 'Auto'}` (`{a.get('device_id') or 'Auto'}`)\n"
-                f"  Sent: `{a.get('sent', 0)}`"
+                f"  Session: {sess} | Status: `{a.get('last_status', 'New')}`\n"
+                f"  Phone: `{a.get('device_name') or 'Auto'}` (`{a.get('device_id') or 'Auto'}`)\n"
+                f"  IP: `{a.get('ip_address') or 'Auto'}` | Sent: `{a.get('sent', 0)}`"
             )
         text = "\n\n".join(blocks)
         if len(text) > 3900:
@@ -451,8 +472,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "menu_settings":
         s = core.load_settings()
+        auto_login_txt = "ON ✅" if s.get("auto_login_on_add", True) else "OFF ❌"
         kb = [
             [InlineKeyboardButton(f"📤 Method: {s.get('send_method', 'web_form')}", callback_data="cycle_method")],
+            [InlineKeyboardButton(f"⚡ Auto Login on Add: {auto_login_txt}", callback_data="toggle_auto_login")],
             [InlineKeyboardButton("📝 Edit Base Appeal Template", callback_data="edit_template")],
             [InlineKeyboardButton("📧 Edit Target Email", callback_data="edit_target")],
             [InlineKeyboardButton(f"⏳ Delay: {s.get('min_delay', 25)}-{s.get('max_delay', 90)}s", callback_data="edit_delays")],
@@ -461,6 +484,17 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             "⚙️ **Settings & Template**",
             reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "toggle_auto_login":
+        s = core.load_settings()
+        s["auto_login_on_add"] = not s.get("auto_login_on_add", True)
+        core.save_settings(s)
+        await q.edit_message_text(
+            f"✅ Auto Login on Add set to: `{'Enabled' if s['auto_login_on_add'] else 'Disabled'}`",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_settings")]]),
             parse_mode="Markdown",
         )
         return
@@ -541,7 +575,7 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             state["step"] = "add_password"
             await update.message.reply_text(
-                "🔒 Send **Account Password** (or send `-` if you prefer verification code / browser login):",
+                "🔒 Send **Account Password** (login starts immediately after saving):",
                 parse_mode="Markdown",
             )
         return
@@ -573,10 +607,38 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         USER_STATES.pop(chat_id, None)
         acc = core.get_account(state["email"])
-        name_str = f"{acc['first_name']} {acc['last_name']}" if acc else ""
+        if not added or not acc:
+            await update.message.reply_text("❌ Account already exists.", reply_markup=build_main_menu())
+            return
+
         await update.message.reply_text(
-            f"✅ Saved account `{state['email']}` (Name: `{name_str}`) via **Email + Code**."
-            if added else "❌ Account already exists.",
+            f"✅ Saved `{acc['email']}`\n"
+            f"📱 Phone: `{acc.get('device_name')}` | ID: `{acc.get('device_id')}`\n"
+            f"🌐 IP: `{acc.get('ip_address')}`\n"
+            f"🔐 Starting direct login now...",
+            reply_markup=build_main_menu(),
+            parse_mode="Markdown",
+        )
+        s = core.load_settings()
+        if s.get("auto_login_on_add", True):
+            asyncio.create_task(execute_login_only(context.bot, chat_id, acc))
+        return
+
+    if step == "set_dev_ip_val":
+        email = state["email"]
+        parts = [p.strip() for p in text.split("|")]
+        updates = {}
+        if len(parts) >= 1 and parts[0]:
+            updates["device_name"] = parts[0]
+        if len(parts) >= 2 and parts[1]:
+            updates["device_id"] = parts[1]
+        if len(parts) >= 3 and parts[2]:
+            updates["ip_address"] = parts[2]
+        if updates:
+            core.update_account(email, **updates)
+        USER_STATES.pop(chat_id, None)
+        await update.message.reply_text(
+            f"✅ Updated device/IP identity for `{email}`.",
             reply_markup=build_main_menu(),
             parse_mode="Markdown",
         )
@@ -661,7 +723,8 @@ async def execute_login_only(bot, chat_id, account):
                 f"✅ **Session Saved!**\n"
                 f"• Account: `{account['email']}`\n"
                 f"• Name: `{fn} {ln}`\n"
-                f"• Device: `{account.get('device_name')}` (`{account.get('device_id')}`)",
+                f"• Phone: `{account.get('device_name')}` (`{account.get('device_id')}`)\n"
+                f"• IP: `{account.get('ip_address')}`",
                 parse_mode="Markdown",
             )
         else:

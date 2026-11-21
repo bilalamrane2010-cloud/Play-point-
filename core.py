@@ -33,28 +33,58 @@ Best regards,"""
 REAL_DEVICES_POOL = [
     {
         "device_name": "Samsung Galaxy S24 Ultra",
-        "device_id": "DEV-S24U-98241",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "device_id": "SM-S928B-98241",
+        "android_version": "14",
+        "build_id": "UP1A.231005.007",
+        "screen_res": "1440x3120",
+        "timezone": "Africa/Algiers",
+        "locale": "en-US",
+        "ip_address": "105.104.22.14",
+        "user_agent": "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36",
     },
     {
         "device_name": "Google Pixel 9 Pro XL",
-        "device_id": "DEV-P9PXL-55109",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "device_id": "PIXEL-9PXL-55109",
+        "android_version": "15",
+        "build_id": "AP3A.240905.015",
+        "screen_res": "1344x2992",
+        "timezone": "Africa/Algiers",
+        "locale": "en-US",
+        "ip_address": "105.104.48.91",
+        "user_agent": "Mozilla/5.0 (Linux; Android 15; Pixel 9 Pro XL) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36",
+    },
+    {
+        "device_name": "Xiaomi Redmi Note 12 Pro 5G",
+        "device_id": "22101316I-73024",
+        "android_version": "14",
+        "build_id": "UKQ1.231003.002",
+        "screen_res": "1080x2400",
+        "timezone": "Africa/Algiers",
+        "locale": "en-US",
+        "ip_address": "105.105.19.63",
+        "user_agent": "Mozilla/5.0 (Linux; Android 14; 22101316I) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.106 Mobile Safari/537.36",
     },
     {
         "device_name": "OnePlus 13",
-        "device_id": "DEV-OP13-73024",
-        "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
-    },
-    {
-        "device_name": "Xiaomi 14 Ultra",
-        "device_id": "DEV-XM14U-61982",
-        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+        "device_id": "OP-PJZ110-61982",
+        "android_version": "15",
+        "build_id": "AP3A.240617.008",
+        "screen_res": "1440x3168",
+        "timezone": "Africa/Algiers",
+        "locale": "en-US",
+        "ip_address": "105.104.87.32",
+        "user_agent": "Mozilla/5.0 (Linux; Android 15; PJZ110) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.106 Mobile Safari/537.36",
     },
     {
         "device_name": "iPhone 16 Pro Max",
-        "device_id": "DEV-IP16PM-84712",
-        "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "device_id": "IPHONE17-2-84712",
+        "android_version": "iOS 18.1",
+        "build_id": "22B83",
+        "screen_res": "1320x2868",
+        "timezone": "Africa/Algiers",
+        "locale": "en-US",
+        "ip_address": "105.105.64.108",
+        "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/131.0.6778.134 Mobile/15E148 Safari/604.1",
     },
 ]
 
@@ -121,6 +151,15 @@ def add_account(
     app_password="",
     password="",
     auth_type="email_code",
+    device_name="",
+    device_id="",
+    ip_address="",
+    user_agent="",
+    timezone="",
+    locale="",
+    screen_res="",
+    android_version="",
+    build_id="",
 ):
     email_clean = email.strip()
     accounts = load_accounts()
@@ -131,6 +170,7 @@ def add_account(
     fn = first_name.strip() or inf_first
     ln = last_name.strip() or inf_last
 
+    base_dev = random.choice(REAL_DEVICES_POOL).copy()
     prof_slug = email_clean.replace("@", "_at_").replace(".", "_")
     accounts.append({
         "email": email_clean,
@@ -141,10 +181,16 @@ def add_account(
         "auth_type": auth_type,
         "logged_in": False,
         "profile_dir": os.path.join(PROFILES_DIR, prof_slug),
-        "device_name": "",
-        "device_id": "",
-        "user_agent": "",
-        "identity_updated_at": 0,
+        "device_name": device_name.strip() or base_dev["device_name"],
+        "device_id": device_id.strip() or f"DEV-{random.randint(100000, 999999)}",
+        "ip_address": ip_address.strip() or os.getenv("DEVICE_IP", "").strip() or base_dev["ip_address"],
+        "user_agent": user_agent.strip() or base_dev["user_agent"],
+        "timezone": timezone.strip() or base_dev["timezone"],
+        "locale": locale.strip() or base_dev["locale"],
+        "screen_res": screen_res.strip() or base_dev["screen_res"],
+        "android_version": android_version.strip() or base_dev["android_version"],
+        "build_id": build_id.strip() or base_dev["build_id"],
+        "identity_updated_at": time.time(),
         "added_at": time.time(),
         "sent": 0,
         "last_status": "New",
@@ -182,6 +228,7 @@ def load_settings():
         "target_email": GOOGLE_PLAY_SUPPORT,
         "base_template": BASE_REPORT_TEMPLATE,
         "rotate_hours": 1,
+        "auto_login_on_add": True,
     })
     with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -224,37 +271,34 @@ def record_stat(email, success, channel, subject):
 
 async def generate_ai_device_identity():
     client, model = _get_ai_client_and_model()
+    item = random.choice(REAL_DEVICES_POOL).copy()
+    item["device_id"] = f"DEV-{random.randint(100000, 999999)}"
+    item["ip_address"] = os.getenv("DEVICE_IP", "").strip() or item.get("ip_address", "105.104.22.14")
     if not client:
-        item = random.choice(REAL_DEVICES_POOL).copy()
-        item["device_id"] = f"ID-{random.randint(100000, 999999)}"
         return item
+
     prompt = (
-        "Generate a real-world existing device_name (such as Samsung Galaxy S24 Ultra, Google Pixel 9 Pro, "
-        "OnePlus 13, iPhone 16 Pro, Xiaomi 14, Dell XPS 15, MacBook Pro), a fictional unique device_id, "
-        "and a realistic Chrome browser user_agent string. Output in English only as valid JSON: "
-        '{"device_name": "...", "device_id": "...", "user_agent": "..."}'
+        "Generate a realistic mobile device profile as valid JSON with keys: "
+        "device_name, device_id, android_version, build_id, screen_res, timezone, locale, ip_address, user_agent. "
+        "Use real-world phone names (Samsung Galaxy S24 Ultra, Google Pixel 9 Pro XL, Redmi Note 12 Pro 5G, OnePlus 13). "
+        "Output JSON only."
     )
     try:
         resp = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.95,
-            max_tokens=220,
+            temperature=0.85,
+            max_tokens=260,
         )
-        raw = resp.choices[0].message.content.strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
+        raw = resp.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
-        if all(k in data and str(data[k]).strip() for k in ("device_name", "device_id", "user_agent")):
-            return {
-                "device_name": str(data["device_name"]).strip(),
-                "device_id": str(data["device_id"]).strip(),
-                "user_agent": str(data["user_agent"]).strip(),
-            }
+        for k in ("device_name", "device_id", "android_version", "build_id", "screen_res", "timezone", "locale", "ip_address", "user_agent"):
+            if data.get(k) and str(data[k]).strip():
+                item[k] = str(data[k]).strip()
+        return item
     except Exception as e:
         logging.error(f"AI device identity error: {e}")
-    item = random.choice(REAL_DEVICES_POOL).copy()
-    item["device_id"] = f"ID-{random.randint(100000, 999999)}"
-    return item
+        return item
 
 
 async def ensure_account_session_identity(account, force_rotate=False):
@@ -269,6 +313,7 @@ async def ensure_account_session_identity(account, force_rotate=False):
         or not account.get("user_agent")
         or not account.get("device_id")
         or not account.get("device_name")
+        or not account.get("ip_address")
         or (now - account.get("identity_updated_at", 0) >= rotate_sec)
     )
 
@@ -279,7 +324,13 @@ async def ensure_account_session_identity(account, force_rotate=False):
     updates = {
         "device_name": identity["device_name"],
         "device_id": identity["device_id"],
+        "ip_address": identity["ip_address"],
         "user_agent": identity["user_agent"],
+        "timezone": identity["timezone"],
+        "locale": identity["locale"],
+        "screen_res": identity["screen_res"],
+        "android_version": identity["android_version"],
+        "build_id": identity["build_id"],
         "identity_updated_at": now,
     }
     update_account(account["email"], **updates)
@@ -393,10 +444,18 @@ def _resolve_chromedriver_path():
     return ChromeDriverManager().install()
 
 
-def _build_chrome_driver(account):
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
+def _parse_resolution(res_str):
+    try:
+        w_str, h_str = str(res_str).lower().split("x", 1)
+        w, h = int(w_str.strip()), int(h_str.strip())
+        if 300 <= w <= 2560 and 500 <= h <= 4000:
+            return w, h
+    except Exception:
+        pass
+    return 412, 915
 
+
+def _build_chrome_driver(account):
     chrome_bin = _resolve_chrome_binary()
     if not chrome_bin:
         raise RuntimeError(
@@ -404,36 +463,93 @@ def _build_chrome_driver(account):
             "Add Dockerfile or nixpacks.toml with chromium + chromedriver and Redeploy."
         )
 
-    opts = webdriver.ChromeOptions()
-    opts.binary_location = chrome_bin
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--headless=new")
-    opts.add_argument("--window-size=1280,900")
-    opts.add_argument("--lang=en-US")
-
     prof_dir = account.get("profile_dir") or os.path.join(
         PROFILES_DIR, account["email"].replace("@", "_at_").replace(".", "_")
     )
     os.makedirs(prof_dir, exist_ok=True)
-    opts.add_argument(f"--user-data-dir={prof_dir}")
-    opts.add_argument("--profile-directory=Default")
 
-    driver_path = _resolve_chromedriver_path()
-    driver = webdriver.Chrome(
-        service=Service(driver_path),
-        options=opts,
+    width, height = _parse_resolution(account.get("screen_res", "1080x2400"))
+    if width > 600:
+        width, height = 412, 915
+
+    ua = account.get("user_agent") or (
+        "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36"
     )
-    driver.execute_cdp_cmd(
-        "Page.addScriptToEvaluateOnNewDocument",
-        {
-            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        },
-    )
+    locale = account.get("locale") or "en-US"
+    tz = account.get("timezone") or "Africa/Algiers"
+    dev_name = account.get("device_name") or "Samsung Galaxy S24 Ultra"
+    dev_id = account.get("device_id") or "DEV-000000"
+    ip_addr = account.get("ip_address") or "105.104.22.14"
+
+    driver = None
+    try:
+        import undetected_chromedriver as uc
+
+        opts = uc.ChromeOptions()
+        opts.binary_location = chrome_bin
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--headless=new")
+        opts.add_argument(f"--window-size={width},{height}")
+        opts.add_argument(f"--lang={locale}")
+        opts.add_argument(f"--user-agent={ua}")
+        driver = uc.Chrome(
+            options=opts,
+            user_data_dir=prof_dir,
+            headless=True,
+            use_subprocess=True,
+        )
+    except Exception:
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+
+        opts = webdriver.ChromeOptions()
+        opts.binary_location = chrome_bin
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+        opts.add_experimental_option("useAutomationExtension", False)
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--headless=new")
+        opts.add_argument(f"--window-size={width},{height}")
+        opts.add_argument(f"--lang={locale}")
+        opts.add_argument(f"--user-agent={ua}")
+        opts.add_argument(f"--user-data-dir={prof_dir}")
+        opts.add_argument("--profile-directory=Default")
+        driver_path = _resolve_chromedriver_path()
+        driver = webdriver.Chrome(service=Service(driver_path), options=opts)
+
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {
+                "source": f"""
+                    Object.defineProperty(navigator, 'webdriver', {{get: () => undefined}});
+                    Object.defineProperty(navigator, 'platform', {{get: () => 'Linux armv8l'}});
+                    window.__DEVICE_IDENTITY__ = {{
+                        deviceName: {json.dumps(dev_name)},
+                        deviceId: {json.dumps(dev_id)},
+                        ipAddress: {json.dumps(ip_addr)}
+                    }};
+                """
+            },
+        )
+        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": tz})
+        driver.execute_cdp_cmd(
+            "Emulation.setDeviceMetricsOverride",
+            {
+                "width": width,
+                "height": height,
+                "deviceScaleFactor": 2.625,
+                "mobile": True,
+            },
+        )
+    except Exception:
+        pass
+
     return driver
 
 
@@ -443,6 +559,38 @@ def _capture_screenshot(driver, email):
     path = os.path.join(SCREENSHOTS_DIR, fname)
     driver.save_screenshot(path)
     return path
+
+
+def _is_insecure_browser_block(driver):
+    try:
+        txt = ((driver.title or "") + " " + (driver.page_source or "")).lower()
+        return (
+            "couldn't sign you in" in txt
+            or "this browser or app may not be secure" in txt
+            or "browser or app may not be secure" in txt
+        )
+    except Exception:
+        return False
+
+
+def _has_real_captcha_challenge(driver):
+    try:
+        from selenium.webdriver.common.by import By
+
+        if _is_insecure_browser_block(driver):
+            return False
+        cur = (driver.current_url or "").lower()
+        if "recaptcha" in cur or "captcha" in cur:
+            return True
+        frames = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='recaptcha'], iframe[title*='recaptcha'], iframe[src*='captcha']")
+        if frames:
+            return True
+        imgs = driver.find_elements(By.CSS_SELECTOR, "img[src*='captcha'], img[alt*='captcha' i]")
+        if imgs:
+            return True
+        return False
+    except Exception:
+        return False
 
 
 def extract_and_save_profile_names(driver, account):
@@ -503,6 +651,10 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         update_account(account["email"], logged_in=True, last_status="Session active")
         return True, "Logged in via saved session"
 
+    if _is_insecure_browser_block(driver):
+        update_account(account["email"], last_status="Blocked: Browser/IP not trusted by Google")
+        return False, "Google blocked sign-in ('This browser or app may not be secure'). Use a trusted session profile or residential IP/proxy."
+
     driver.get("https://accounts.google.com/signin/v2/identifier?hl=en")
     try:
         email_input = WebDriverWait(driver, 20).until(
@@ -515,24 +667,27 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
     except Exception as e:
         return False, f"Failed to enter email: {e}"
 
-    if "challenge" in driver.current_url or "captcha" in driver.page_source.lower():
-        if challenge_callback:
-            shot = _capture_screenshot(driver, account["email"])
-            code = await challenge_callback(
-                account["email"],
-                "captcha",
-                shot,
-                "CAPTCHA verification required. Enter the code shown in the screenshot or /cancel:",
-            )
-            if not code or code.lower() == "/cancel":
-                return False, "Cancelled by user"
-            try:
-                cap_box = driver.find_element(By.CSS_SELECTOR, "input[type='text']")
-                cap_box.send_keys(code)
-                cap_box.send_keys(Keys.ENTER)
-                await asyncio.sleep(3)
-            except Exception:
-                pass
+    if _is_insecure_browser_block(driver):
+        update_account(account["email"], last_status="Blocked: Browser/IP not trusted by Google")
+        return False, "Google blocked sign-in ('This browser or app may not be secure')."
+
+    if _has_real_captcha_challenge(driver) and challenge_callback:
+        shot = _capture_screenshot(driver, account["email"])
+        code = await challenge_callback(
+            account["email"],
+            "captcha",
+            shot,
+            "CAPTCHA challenge detected. Enter verification text/code or /cancel:",
+        )
+        if not code or code.lower() == "/cancel":
+            return False, "Cancelled by user"
+        try:
+            cap_box = driver.find_element(By.CSS_SELECTOR, "input[type='text']")
+            cap_box.send_keys(code)
+            cap_box.send_keys(Keys.ENTER)
+            await asyncio.sleep(3)
+        except Exception:
+            pass
 
     try:
         pwd_input = WebDriverWait(driver, 15).until(
@@ -561,6 +716,10 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
     notified_2fa = False
     start = time.time()
     while time.time() - start < timeout:
+        if _is_insecure_browser_block(driver):
+            update_account(account["email"], last_status="Blocked: Browser/IP not trusted by Google")
+            return False, "Google blocked sign-in ('This browser or app may not be secure')."
+
         cur = driver.current_url
         if "myaccount.google.com" in cur or "mail.google.com" in cur or "support.google.com" in cur:
             if "signin" not in cur and "challenge" not in cur:
@@ -590,7 +749,7 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
 
         await asyncio.sleep(3)
 
-    return False, "2FA or CAPTCHA timeout"
+    return False, "2FA or verification timeout"
 
 
 async def send_via_gethelp_form(account, body_text, challenge_callback=None):
