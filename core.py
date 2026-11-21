@@ -920,11 +920,31 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
                     pass
             return False
 
-        # Step 1: Enter issue description in first visible input/textarea
+        from selenium.webdriver.support.ui import Select
+
+        def _select_any_dropdown():
+            for sel_el in driver.find_elements(By.TAG_NAME, "select"):
+                try:
+                    if not sel_el.is_displayed() or not sel_el.is_enabled():
+                        continue
+                    s = Select(sel_el)
+                    chosen = False
+                    for opt in s.options:
+                        ot = (opt.text or "").strip().lower()
+                        if "google play apps" in ot or "play pass" in ot:
+                            s.select_by_visible_text(opt.text)
+                            chosen = True
+                            break
+                    if not chosen and len(s.options) > 1:
+                        s.select_by_index(1)
+                except Exception:
+                    pass
+
+        # Step 1: Enter issue description in first visible input
         try:
             vis_inputs = WebDriverWait(driver, 10).until(
                 lambda d: [
-                    el for el in d.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type]), textarea")
+                    el for el in d.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type])")
                     if el.is_displayed() and el.is_enabled()
                 ]
             )
@@ -934,55 +954,77 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
                     vis_inputs[0].send_keys(Keys.ENTER)
                 except Exception:
                     pass
-                await asyncio.sleep(1.2)
-                _click_by_texts(["next", "التالي"])
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.5)
+                _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"])
+                await asyncio.sleep(1.8)
         except Exception:
             pass
 
-        # Select issue chip / option (Play Points or fallback 'Other' / 'غير ذلك')
-        if not _click_by_texts(["play points", "نقاط play", "رصيد play"]):
+        # Select issue description chip ("Play Points issue") and specific area dropdown ("Google Play Apps")
+        if not _click_by_texts(["play points issue", "play points", "نقاط play", "رصيد play"]):
             _click_by_texts(["other", "غير ذلك"])
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(0.8)
+        _select_any_dropdown()
+        await asyncio.sleep(0.8)
 
-        # Advance through Next step / الخطوة التالية while checking if form fields already appeared
+        # Advance through Step 1 -> Step 2 (Resources) -> Step 3 (Contact options)
         for _ in range(4):
             if _visible_elements("textarea"):
                 break
             if _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"]):
-                await asyncio.sleep(1.2)
+                await asyncio.sleep(1.6)
             else:
                 break
 
-        # Select Email / البريد الإلكتروني option if shown
+        # Step 3: Select Email / البريد الإلكتروني
         _click_by_texts(["email", "البريد الإلكتروني"])
-        await asyncio.sleep(1.2)
+        await asyncio.sleep(1.6)
 
-        # Fill visible text inputs (First Name, Last Name, etc.)
+        # Fill visible text inputs: First Name, Last Name, and Transaction ID ("N/A" as required by Google Play Help)
         vis_text_inputs = _visible_elements("input[type='text'], input:not([type])")
-        if len(vis_text_inputs) >= 1 and not (vis_text_inputs[0].get_attribute("value") or "").strip():
-            _safe_type(vis_text_inputs[0], first_name)
-        if len(vis_text_inputs) >= 2 and not (vis_text_inputs[1].get_attribute("value") or "").strip():
-            _safe_type(vis_text_inputs[1], last_name)
-        if len(vis_text_inputs) >= 3 and not (vis_text_inputs[2].get_attribute("value") or "").strip():
-            _safe_type(vis_text_inputs[2], "N/A")
+        for idx, inp in enumerate(vis_text_inputs):
+            cur_val = (inp.get_attribute("value") or "").strip()
+            parent_txt = ""
+            try:
+                parent_txt = (inp.find_element(By.XPATH, "./ancestor::*[self::div or self::section][1]").text or "").lower()
+            except Exception:
+                pass
+            if "transaction id" in parent_txt or "order id" in parent_txt:
+                _safe_type(inp, "N/A")
+            elif idx == 0 and not cur_val:
+                _safe_type(inp, first_name)
+            elif idx == 1 and not cur_val:
+                _safe_type(inp, last_name)
+            elif not cur_val:
+                _safe_type(inp, "N/A")
 
-        # Select radio / option if present (e.g. "لا" / "No" for purchase error question)
-        _click_by_texts(["لا", "no"])
-        await asyncio.sleep(0.5)
-
-        # Fill textarea if present on the form step
+        # Fill textarea ("Describe your issue *")
         vis_areas = _visible_elements("textarea")
         if vis_areas:
             _safe_type(vis_areas[0], body_text)
             await asyncio.sleep(0.6)
 
         # Click Submit / إرسال
-        if not _click_by_texts(["submit", "إرسال"]):
+        clicked_submit = _click_by_texts(["submit", "إرسال", "send"])
+        if not clicked_submit:
+            for css_sub in ("button[type='submit']", "input[type='submit']", "[aria-label*='submit' i]", "[aria-label*='إرسال' i]"):
+                subs = _visible_elements(css_sub)
+                if subs:
+                    _safe_click(subs[0])
+                    clicked_submit = True
+                    break
+
+        if not clicked_submit:
             _capture_screenshot(driver, account["email"])
             raise RuntimeError(
                 f"Submit/Send button not found on {driver.current_url or GETHELP_URL} (title: {driver.title or 'N/A'})"
             )
+
+        await asyncio.sleep(2.2)
+        page_lower = (driver.page_source or "").lower()
+        if "we couldn't submit your form yet" in page_lower or "please fix the fields above" in page_lower:
+            _capture_screenshot(driver, account["email"])
+            raise RuntimeError("GetHelp form validation error after clicking Submit")
 
         await asyncio.sleep(2.2)
         return True, "Submitted via Google Play GetHelp"
