@@ -1018,9 +1018,14 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
             else:
                 break
 
-        # Step 3: Select Email / البريد الإلكتروني
+        # Step 3: Select Email / البريد الإلكتروني and wait for the contact form fields to render
         _click_by_texts(["email", "البريد الإلكتروني"])
-        await asyncio.sleep(1.6)
+        await asyncio.sleep(2.2)
+
+        # If Email option didn't open the form yet, advance once more if Next step is present
+        if not _visible_elements("textarea") and not _visible_elements("input[type='text']"):
+            _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"])
+            await asyncio.sleep(2.0)
 
         # Fill visible email input if shown on the GetHelp contact form
         for e_inp in _visible_elements("input[type='email']"):
@@ -1049,7 +1054,7 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
         vis_areas = _visible_elements("textarea")
         if vis_areas:
             _safe_type(vis_areas[0], body_text)
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.8)
 
         # Analyze and verify final step with AI strictly bound to the appeal points
         visible_btns = [
@@ -1065,15 +1070,41 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
             last_name=last_name,
         )
 
-        # Click Submit / إرسال
+        # Scroll down so lazy-rendered Submit button and validation states are mounted/visible
+        try:
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+            await asyncio.sleep(0.7)
+        except Exception:
+            pass
+
+        # Click Submit / إرسال (including elements with aria-label or uppercase/lowercase text)
         clicked_submit = _click_by_texts(["submit", "إرسال", "send"])
         if not clicked_submit:
-            for css_sub in ("button[type='submit']", "input[type='submit']", "[aria-label*='submit' i]", "[aria-label*='إرسال' i]"):
+            for css_sub in (
+                "button[type='submit']",
+                "input[type='submit']",
+                "[aria-label*='submit' i]",
+                "[aria-label*='إرسال' i]",
+                "[aria-label*='send' i]",
+            ):
                 subs = _visible_elements(css_sub)
                 if subs:
                     _safe_click(subs[0])
                     clicked_submit = True
                     break
+        if not clicked_submit:
+            # Fallback check across all buttons/role=button including aria-label even if innerText is empty
+            for el in driver.find_elements(By.XPATH, "//button | //div[@role='button'] | //input[@type='button'] | //input[@type='submit']"):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    blob = ((el.text or "") + " " + (el.get_attribute("aria-label") or "")).strip().lower()
+                    if any(k in blob for k in ("submit", "send", "إرسال")):
+                        _safe_click(el)
+                        clicked_submit = True
+                        break
+                except Exception:
+                    pass
 
         if not clicked_submit:
             _capture_screenshot(driver, account["email"])
