@@ -635,8 +635,8 @@ def _click_next_if_present(driver):
         btns = [
             b for b in driver.find_elements(
                 By.XPATH,
-                "//button[contains(., 'Next') or contains(., 'next') or @id='identifierNext' or @id='passwordNext'] | "
-                "//div[@role='button'][contains(., 'Next')]",
+                "//button[contains(., 'Next') or contains(., 'next') or contains(., 'التالي') or @id='identifierNext' or @id='passwordNext'] | "
+                "//div[@role='button'][contains(., 'Next') or contains(., 'التالي')]",
             )
             if b.is_displayed() and b.is_enabled()
         ]
@@ -846,6 +846,7 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
 
 async def send_via_gethelp_form(account, body_text, challenge_callback=None):
     from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import WebDriverWait
 
     account = await ensure_account_session_identity(account)
@@ -904,6 +905,22 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
                 pass
             return out
 
+        def _click_by_texts(texts_lower):
+            for el in driver.find_elements(By.XPATH, "//button | //div[@role='button'] | //span | //label"):
+                try:
+                    if not el.is_displayed():
+                        continue
+                    t = (el.text or "").strip().lower()
+                    if not t:
+                        continue
+                    if any(k in t for k in texts_lower):
+                        _safe_click(el)
+                        return True
+                except Exception:
+                    pass
+            return False
+
+        # Step 1: Enter issue description in first visible input/textarea
         try:
             vis_inputs = WebDriverWait(driver, 10).until(
                 lambda d: [
@@ -913,88 +930,61 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
             )
             if vis_inputs:
                 _safe_type(vis_inputs[0], "Play point issues")
-                await asyncio.sleep(0.7)
-                next_btns = [
-                    b for b in driver.find_elements(By.XPATH, "//button[contains(., 'Next')]")
-                    if b.is_displayed() and b.is_enabled()
-                ]
-                if next_btns:
-                    _safe_click(next_btns[0])
-                    await asyncio.sleep(1.5)
-        except Exception:
-            pass
-
-        try:
-            chips = [
-                c for c in driver.find_elements(
-                    By.XPATH,
-                    "//*[contains(translate(text(), 'PLAY POINTS ISSUE', 'play points issue'), 'play points issue')]",
-                )
-                if c.is_displayed()
-            ]
-            if chips:
-                _safe_click(chips[0])
+                try:
+                    vis_inputs[0].send_keys(Keys.ENTER)
+                except Exception:
+                    pass
+                await asyncio.sleep(1.2)
+                _click_by_texts(["next", "التالي"])
                 await asyncio.sleep(1.2)
         except Exception:
             pass
 
-        for _ in range(3):
-            try:
-                ns_list = [
-                    b for b in driver.find_elements(
-                        By.XPATH,
-                        "//button[contains(translate(., 'NEXT STEP', 'next step'), 'next step')]",
-                    )
-                    if b.is_displayed() and b.is_enabled()
-                ]
-                if not ns_list:
-                    break
-                _safe_click(ns_list[0])
+        # Select issue chip / option (Play Points or fallback 'Other' / 'غير ذلك')
+        if not _click_by_texts(["play points", "نقاط play", "رصيد play"]):
+            _click_by_texts(["other", "غير ذلك"])
+        await asyncio.sleep(1.0)
+
+        # Advance through Next step / الخطوة التالية while checking if form fields already appeared
+        for _ in range(4):
+            if _visible_elements("textarea"):
+                break
+            if _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"]):
                 await asyncio.sleep(1.2)
-            except Exception:
+            else:
                 break
 
-        try:
-            email_opts = [
-                e for e in driver.find_elements(
-                    By.XPATH,
-                    "//*[contains(translate(text(), 'EMAIL', 'email'), 'email')]",
-                )
-                if e.is_displayed()
-            ]
-            if email_opts:
-                _safe_click(email_opts[0])
-                await asyncio.sleep(1.5)
-        except Exception:
-            pass
+        # Select Email / البريد الإلكتروني option if shown
+        _click_by_texts(["email", "البريد الإلكتروني"])
+        await asyncio.sleep(1.2)
 
+        # Fill visible text inputs (First Name, Last Name, etc.)
         vis_text_inputs = _visible_elements("input[type='text'], input:not([type])")
-        if len(vis_text_inputs) >= 3:
+        if len(vis_text_inputs) >= 1 and not (vis_text_inputs[0].get_attribute("value") or "").strip():
             _safe_type(vis_text_inputs[0], first_name)
+        if len(vis_text_inputs) >= 2 and not (vis_text_inputs[1].get_attribute("value") or "").strip():
             _safe_type(vis_text_inputs[1], last_name)
+        if len(vis_text_inputs) >= 3 and not (vis_text_inputs[2].get_attribute("value") or "").strip():
             _safe_type(vis_text_inputs[2], "N/A")
 
+        # Select radio / option if present (e.g. "لا" / "No" for purchase error question)
+        _click_by_texts(["لا", "no"])
+        await asyncio.sleep(0.5)
+
+        # Fill textarea if present on the form step
         vis_areas = _visible_elements("textarea")
-        if not vis_areas:
+        if vis_areas:
+            _safe_type(vis_areas[0], body_text)
+            await asyncio.sleep(0.6)
+
+        # Click Submit / إرسال
+        if not _click_by_texts(["submit", "إرسال"]):
             _capture_screenshot(driver, account["email"])
             raise RuntimeError(
-                f"GetHelp textarea not found on {driver.current_url or GETHELP_URL} (title: {driver.title or 'N/A'})"
+                f"Submit/Send button not found on {driver.current_url or GETHELP_URL} (title: {driver.title or 'N/A'})"
             )
-        _safe_type(vis_areas[0], body_text)
-        await asyncio.sleep(0.7)
 
-        submit_btns = [
-            b for b in driver.find_elements(
-                By.XPATH,
-                "//button[contains(translate(., 'SUBMIT', 'submit'), 'submit')]",
-            )
-            if b.is_displayed() and b.is_enabled()
-        ]
-        if not submit_btns:
-            _capture_screenshot(driver, account["email"])
-            raise RuntimeError(f"Submit button not found on {driver.current_url or GETHELP_URL}")
-        _safe_click(submit_btns[0])
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(2.2)
         return True, "Submitted via Google Play GetHelp"
     except Exception as e:
         err = _format_exc(e)
