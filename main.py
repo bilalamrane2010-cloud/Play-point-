@@ -708,7 +708,7 @@ async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    token = os.getenv("9204455871:AAGTPgz2d086vZCYlFkrcDCci7DWr6un9oY")
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "9204455871:AAGTPgz2d086vZCYlFkrcDCci7DWr6un9oY").strip()
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN missing")
 
