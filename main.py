@@ -228,7 +228,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         accounts = core.load_accounts()
         kb = [
             [
-                InlineKeyboardButton("➕ Add Account", callback_data="acc_add"),
+                InlineKeyboardButton("➕ Add Account", callback_data="acc_add_choose_mode"),
                 InlineKeyboardButton("📋 List Accounts", callback_data="acc_list"),
             ],
             [
@@ -247,6 +247,29 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             f"👤 **Accounts Manager ({len(accounts)})**",
             reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "acc_add_choose_mode":
+        kb = [
+            [InlineKeyboardButton("📧 Email + Verification Code (Web Form)", callback_data="acc_add_mode::email_code")],
+            [InlineKeyboardButton("🔑 Email + App Password (SMTP)", callback_data="acc_add_mode::app_password")],
+            [InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")],
+        ]
+        await q.edit_message_text(
+            "➕ **Choose Login / Add Method:**",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("acc_add_mode::"):
+        mode = data.split("::", 1)[1]
+        USER_STATES[chat_id] = {"step": "add_email", "auth_type": mode}
+        label = "Email + Code (Web Form)" if mode == "email_code" else "Email + App Password (SMTP)"
+        await q.edit_message_text(
+            f"📧 Method: **{label}**\nSend **Gmail address** (Name & Surname are extracted automatically):",
             parse_mode="Markdown",
         )
         return
@@ -287,11 +310,6 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if data == "acc_add":
-        USER_STATES[chat_id] = {"step": "add_email"}
-        await q.edit_message_text("📧 Send **Gmail address**:", parse_mode="Markdown")
-        return
-
     if data == "acc_list":
         accounts = core.load_accounts()
         if not accounts:
@@ -303,8 +321,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         blocks = []
         for a in accounts:
             sess = "Saved 🔒" if a.get("logged_in") else "Not logged in"
+            mode_txt = "Email+Code" if a.get("auth_type", "email_code") == "email_code" else "App Password"
             blocks.append(
-                f"• `{a['email']}` ({a.get('first_name', '')} {a.get('last_name', '')})\n"
+                f"• `{a['email']}` — **{a.get('first_name', '')} {a.get('last_name', '')}** [{mode_txt}]\n"
                 f"  Session: {sess} | SMTP: {'✓' if a.get('app_password') else '✗'} | Pass: {'✓' if a.get('password') else '✗'}\n"
                 f"  Device: `{a.get('device_name') or 'Auto'}` (`{a.get('device_id') or 'Auto'}`)\n"
                 f"  Sent: `{a.get('sent', 0)}`"
@@ -394,7 +413,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await q.edit_message_text(
             f"🔐 Starting login session for `{email}`...\n"
-            "CAPTCHA or 2FA screenshots will appear here.",
+            "Verification code / 2FA prompts or screenshots will appear here.",
             parse_mode="Markdown",
         )
         asyncio.create_task(execute_login_only(context.bot, chat_id, acc))
@@ -515,37 +534,49 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ Invalid email. Try again:")
             return
         state["email"] = text
-        state["step"] = "add_fullname"
-        await update.message.reply_text("🪪 Send **First and Last Name** or `/skip`:", parse_mode="Markdown")
-        return
-
-    if step == "add_fullname":
-        if text.lower() != "/skip":
-            parts = text.split(None, 1)
-            state["first_name"] = parts[0]
-            state["last_name"] = parts[1] if len(parts) > 1 else ""
-        state["step"] = "add_app_password"
-        await update.message.reply_text("🔑 Send **App Password** (16 chars) or `/skip`:", parse_mode="Markdown")
+        auth_type = state.get("auth_type", "email_code")
+        if auth_type == "app_password":
+            state["step"] = "add_app_password"
+            await update.message.reply_text("🔑 Send **App Password** (16 chars):")
+        else:
+            state["step"] = "add_password"
+            await update.message.reply_text(
+                "🔒 Send **Account Password** (or send `-` if you prefer verification code / browser login):",
+                parse_mode="Markdown",
+            )
         return
 
     if step == "add_app_password":
-        state["app_password"] = "" if text.lower() == "/skip" else text
-        state["step"] = "add_password"
-        await update.message.reply_text("🔒 Send **Account Password** or `/skip`:", parse_mode="Markdown")
+        app_pw = "" if text == "-" else text
+        added = core.add_account(
+            email=state["email"],
+            app_password=app_pw,
+            auth_type="app_password",
+        )
+        USER_STATES.pop(chat_id, None)
+        acc = core.get_account(state["email"])
+        name_str = f"{acc['first_name']} {acc['last_name']}" if acc else ""
+        await update.message.reply_text(
+            f"✅ Saved account `{state['email']}` (Name: `{name_str}`) via **App Password**."
+            if added else "❌ Account already exists.",
+            reply_markup=build_main_menu(),
+            parse_mode="Markdown",
+        )
         return
 
     if step == "add_password":
-        state["password"] = "" if text.lower() == "/skip" else text
+        pw = "" if text == "-" else text
         added = core.add_account(
             email=state["email"],
-            first_name=state.get("first_name", ""),
-            last_name=state.get("last_name", ""),
-            app_password=state.get("app_password", ""),
-            password=state.get("password", ""),
+            password=pw,
+            auth_type="email_code",
         )
         USER_STATES.pop(chat_id, None)
+        acc = core.get_account(state["email"])
+        name_str = f"{acc['first_name']} {acc['last_name']}" if acc else ""
         await update.message.reply_text(
-            f"✅ Saved account `{state['email']}`." if added else "❌ Account already exists.",
+            f"✅ Saved account `{state['email']}` (Name: `{name_str}`) via **Email + Code**."
+            if added else "❌ Account already exists.",
             reply_markup=build_main_menu(),
             parse_mode="Markdown",
         )
@@ -624,7 +655,7 @@ async def execute_login_only(bot, chat_id, account):
         driver = core._build_chrome_driver(account)
         ok, msg = await core._interactive_google_login(driver, account, cb)
         if ok:
-            fn, ln = core._extract_profile_names_if_missing(driver, account)
+            fn, ln = core.extract_and_save_profile_names(driver, account)
             await bot.send_message(
                 chat_id,
                 f"✅ **Session Saved!**\n"

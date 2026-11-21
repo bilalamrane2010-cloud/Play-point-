@@ -2,6 +2,7 @@ import os
 import json
 import time
 import random
+import shutil
 import asyncio
 import logging
 import smtplib
@@ -84,6 +85,16 @@ def _ensure_file(path, default):
             json.dump(default, f, ensure_ascii=False, indent=2)
 
 
+def infer_name_from_email(email):
+    local = email.split("@")[0].replace(".", " ").replace("_", " ").replace("-", " ").strip()
+    parts = [p.capitalize() for p in local.split() if p.isalpha()]
+    if len(parts) >= 2:
+        return parts[0], " ".join(parts[1:])
+    if len(parts) == 1:
+        return parts[0], "User"
+    return (local.capitalize() or "Play"), "User"
+
+
 def load_accounts():
     _ensure_file(ACCOUNTS_FILE, [])
     with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
@@ -109,19 +120,25 @@ def add_account(
     last_name="",
     app_password="",
     password="",
-    login_mode="auto",
+    auth_type="email_code",
 ):
+    email_clean = email.strip()
     accounts = load_accounts()
-    if any(a["email"].lower() == email.lower() for a in accounts):
+    if any(a["email"].lower() == email_clean.lower() for a in accounts):
         return False
-    prof_slug = email.replace("@", "_at_").replace(".", "_")
+
+    inf_first, inf_last = infer_name_from_email(email_clean)
+    fn = first_name.strip() or inf_first
+    ln = last_name.strip() or inf_last
+
+    prof_slug = email_clean.replace("@", "_at_").replace(".", "_")
     accounts.append({
-        "email": email.strip(),
-        "first_name": first_name.strip(),
-        "last_name": last_name.strip(),
+        "email": email_clean,
+        "first_name": fn,
+        "last_name": ln,
         "app_password": app_password.strip(),
         "password": password.strip(),
-        "login_mode": login_mode,
+        "auth_type": auth_type,
         "logged_in": False,
         "profile_dir": os.path.join(PROFILES_DIR, prof_slug),
         "device_name": "",
@@ -348,23 +365,56 @@ def test_smtp(account):
         return False, str(e)
 
 
+def _resolve_chrome_binary():
+    candidates = [
+        os.getenv("CHROME_BIN", "").strip(),
+        shutil.which("google-chrome"),
+        shutil.which("chromium"),
+        shutil.which("chromium-browser"),
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium",
+        "/usr/bin/chromium-browser",
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            return c
+    return None
+
+
+def _resolve_chromedriver_path():
+    env_drv = os.getenv("CHROMEDRIVER_PATH", "").strip()
+    if env_drv and os.path.exists(env_drv):
+        return env_drv
+    for name in ("chromedriver",):
+        p = shutil.which(name)
+        if p and os.path.exists(p):
+            return p
+    from webdriver_manager.chrome import ChromeDriverManager
+    return ChromeDriverManager().install()
+
+
 def _build_chrome_driver(account):
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
+
+    chrome_bin = _resolve_chrome_binary()
+    if not chrome_bin:
+        raise RuntimeError(
+            "Google Chrome / Chromium not found in container. "
+            "Add Dockerfile or nixpacks.toml with chromium + chromedriver and Redeploy."
+        )
 
     opts = webdriver.ChromeOptions()
+    opts.binary_location = chrome_bin
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
     opts.add_argument("--headless=new")
     opts.add_argument("--window-size=1280,900")
     opts.add_argument("--lang=en-US")
-
-    if account.get("user_agent"):
-        opts.add_argument(f"--user-agent={account['user_agent']}")
 
     prof_dir = account.get("profile_dir") or os.path.join(
         PROFILES_DIR, account["email"].replace("@", "_at_").replace(".", "_")
@@ -373,8 +423,9 @@ def _build_chrome_driver(account):
     opts.add_argument(f"--user-data-dir={prof_dir}")
     opts.add_argument("--profile-directory=Default")
 
+    driver_path = _resolve_chromedriver_path()
     driver = webdriver.Chrome(
-        service=Service(ChromeDriverManager().install()),
+        service=Service(driver_path),
         options=opts,
     )
     driver.execute_cdp_cmd(
@@ -394,6 +445,50 @@ def _capture_screenshot(driver, email):
     return path
 
 
+def extract_and_save_profile_names(driver, account):
+    first_name = (account.get("first_name") or "").strip()
+    last_name = (account.get("last_name") or "").strip()
+
+    try:
+        driver.get("https://myaccount.google.com/profile/name?hl=en")
+        time.sleep(3)
+        inputs = driver.find_elements("css selector", "input[type='text']")
+        vals = [i.get_attribute("value").strip() for i in inputs if i.get_attribute("value")]
+        if len(vals) >= 2:
+            first_name, last_name = vals[0], vals[1]
+            update_account(account["email"], first_name=first_name, last_name=last_name)
+            return first_name, last_name
+        if len(vals) == 1 and " " in vals[0]:
+            p = vals[0].split(None, 1)
+            first_name, last_name = p[0], p[1]
+            update_account(account["email"], first_name=first_name, last_name=last_name)
+            return first_name, last_name
+    except Exception:
+        pass
+
+    try:
+        driver.get("https://myaccount.google.com/?hl=en")
+        time.sleep(3)
+        headings = driver.find_elements("css selector", "h1, [role='heading']")
+        for h in headings:
+            txt = (h.text or "").strip()
+            if txt and "@" not in txt and len(txt.split()) >= 2 and len(txt) < 60:
+                p = txt.split(None, 1)
+                first_name, last_name = p[0], p[1]
+                update_account(account["email"], first_name=first_name, last_name=last_name)
+                return first_name, last_name
+    except Exception:
+        pass
+
+    if not first_name or not last_name:
+        inf_f, inf_l = infer_name_from_email(account["email"])
+        first_name = first_name or inf_f
+        last_name = last_name or inf_l
+        update_account(account["email"], first_name=first_name, last_name=last_name)
+
+    return first_name, last_name
+
+
 async def _interactive_google_login(driver, account, challenge_callback=None, timeout=180):
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
@@ -404,6 +499,7 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
     await asyncio.sleep(4)
 
     if "myaccount.google.com" in driver.current_url and "signin" not in driver.current_url:
+        extract_and_save_profile_names(driver, account)
         update_account(account["email"], logged_in=True, last_status="Session active")
         return True, "Logged in via saved session"
 
@@ -442,10 +538,21 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         pwd_input = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.NAME, "Passwd"))
         )
-        if not account.get("password"):
-            return False, "Account password not set"
+        pwd_to_use = (account.get("password") or "").strip()
+        if not pwd_to_use and challenge_callback:
+            shot = _capture_screenshot(driver, account["email"])
+            reply = await challenge_callback(
+                account["email"],
+                "password",
+                shot,
+                "Enter the Google account password (or /cancel):",
+            )
+            if reply and reply.lower() != "/cancel" and reply.lower() not in ("done", "ok"):
+                pwd_to_use = reply.strip()
+        if not pwd_to_use:
+            return False, "Account password not provided"
         pwd_input.clear()
-        pwd_input.send_keys(account["password"])
+        pwd_input.send_keys(pwd_to_use)
         pwd_input.send_keys(Keys.ENTER)
         await asyncio.sleep(4)
     except Exception:
@@ -457,6 +564,7 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         cur = driver.current_url
         if "myaccount.google.com" in cur or "mail.google.com" in cur or "support.google.com" in cur:
             if "signin" not in cur and "challenge" not in cur:
+                extract_and_save_profile_names(driver, account)
                 update_account(account["email"], logged_in=True, last_status="Logged in and session saved")
                 return True, "Logged in successfully"
 
@@ -467,13 +575,13 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
                 account["email"],
                 "2fa",
                 shot,
-                "2FA verification required: approve on your device or send the verification code (or /cancel):",
+                "Verification code / 2FA required: send the code from your email/phone or approve and tap Done:",
             )
             if user_reply and user_reply.lower() == "/cancel":
                 return False, "2FA cancelled"
             if user_reply and user_reply.lower() not in ("done", "ok"):
                 try:
-                    code_input = driver.find_element(By.CSS_SELECTOR, "input[type='tel'], input[type='text']")
+                    code_input = driver.find_element(By.CSS_SELECTOR, "input[type='tel'], input[type='text'], input[type='number']")
                     code_input.clear()
                     code_input.send_keys(user_reply.strip())
                     code_input.send_keys(Keys.ENTER)
@@ -483,23 +591,6 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         await asyncio.sleep(3)
 
     return False, "2FA or CAPTCHA timeout"
-
-
-def _extract_profile_names_if_missing(driver, account):
-    if account.get("first_name") and account.get("last_name"):
-        return account["first_name"], account["last_name"]
-    try:
-        driver.get("https://myaccount.google.com/profile/name?hl=en")
-        time.sleep(3)
-        inputs = driver.find_elements("css selector", "input[type='text']")
-        vals = [i.get_attribute("value").strip() for i in inputs if i.get_attribute("value")]
-        if len(vals) >= 2:
-            update_account(account["email"], first_name=vals[0], last_name=vals[1])
-            return vals[0], vals[1]
-    except Exception:
-        pass
-    local_part = account["email"].split("@")[0]
-    return account.get("first_name") or local_part, account.get("last_name") or "User"
 
 
 async def send_via_gethelp_form(account, body_text, challenge_callback=None):
@@ -515,7 +606,7 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
         if not ok:
             return False, msg
 
-        first_name, last_name = _extract_profile_names_if_missing(driver, account)
+        first_name, last_name = extract_and_save_profile_names(driver, account)
 
         driver.get(f"{GETHELP_URL}?hl=en")
         await asyncio.sleep(4)
