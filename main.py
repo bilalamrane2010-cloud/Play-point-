@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import random
 import time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -25,6 +24,7 @@ DEFAULT_BOT_TOKEN = "9204455871:AAGTPgz2d086vZCYlFkrcDCci7DWr6un9oY"
 USER_STATES = {}
 ACTIVE_CHALLENGES = {}
 LAST_AUTO_RUN = {"ts": 0}
+AUTO_BATCH_LOCK = asyncio.Lock()
 
 
 def build_main_menu():
@@ -61,7 +61,8 @@ def render_dashboard():
         "━━━━━━━━━━━━━━\n"
         f"• الحسابات: {len(accounts)}\n"
         f"• الإرسال التلقائي: {'مفعّل ✅' if s.get('auto_send_enabled') else 'متوقف ⏸️'}\n"
-        f"• كل: {s.get('auto_send_interval', 60)} دقيقة\n"
+        f"• دورة التلقائي: كل {s.get('auto_send_interval', 60)} دقيقة\n"
+        f"• المدة بين كل حساب: {s.get('between_accounts_delay', 30)} ثانية\n"
         f"• الطريقة: {method_labels.get(s.get('send_method', 'auto'), 'تلقائي ذكي')}\n"
         f"• تم الإرسال: {st.get('total_sent', 0)} | فشل: {st.get('failed', 0)}\n"
         "━━━━━━━━━━━━━━"
@@ -184,7 +185,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "set_interval":
         USER_STATES[chat_id] = {"step": "set_interval"}
-        await q.edit_message_text("⏱️ أرسل الفاصل الزمني بالدقائق (مثال: 60) أو /cancel:")
+        await q.edit_message_text("⏱️ أرسل الفاصل الزمني بين كل دورة إرسال تلقائي بالدقائق (مثال: 60) أو /cancel:")
         return
 
     if data == "menu_send_now":
@@ -195,10 +196,14 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_main")]]),
             )
             return
-        kb = [[InlineKeyboardButton(f"📨 {a['email']}", callback_data=f"run_send::{a['email']}")] for a in accounts]
-        kb.append([InlineKeyboardButton("🎲 حساب عشوائي", callback_data="run_send::RANDOM")])
+        kb = [[InlineKeyboardButton("📨 إرسال بكل الحسابات", callback_data="run_send::ALL")]]
+        for a in accounts:
+            kb.append([InlineKeyboardButton(f"👤 {a['email']}", callback_data=f"run_send::{a['email']}")])
         kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_main")])
-        await q.edit_message_text("اختر الحساب للإرسال:", reply_markup=InlineKeyboardMarkup(kb))
+        await q.edit_message_text(
+            "اختر إرسال البلاغ بكل الحسابات أو تحديد حساب واحد:",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
         return
 
     if data.startswith("run_send::"):
@@ -207,11 +212,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not accounts:
             await q.edit_message_text("❌ لا توجد حسابات.")
             return
-        acc = random.choice(accounts) if target == "RANDOM" else core.get_account(target)
+
+        if target == "ALL":
+            delay_sec = max(0, int(core.load_settings().get("between_accounts_delay", 30)))
+            await q.edit_message_text(
+                f"⏳ جاري بدء الإرسال بكل الحسابات ({len(accounts)} حساب) مع فاصل {delay_sec} ثانية بين كل حساب..."
+            )
+            asyncio.create_task(execute_all_accounts_task(context.bot, chat_id, accounts, delay_sec))
+            return
+
+        acc = core.get_account(target)
         if not acc:
             await q.edit_message_text("❌ الحساب غير موجود.")
             return
-        await q.edit_message_text(f"⏳ جاري إرسال البلاغ من {acc['email']}...")
+        await q.edit_message_text(f"⏳ جاري إرسال البلاغ من الحساب: {acc['email']}...")
         asyncio.create_task(execute_report_task(context.bot, chat_id, acc))
         return
 
@@ -382,10 +396,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "gmail_web": "ويب Gmail",
         }
         cur_label = method_labels.get(s.get("send_method", "auto"), "تلقائي ذكي")
+        between_sec = s.get("between_accounts_delay", 30)
         kb = [
             [InlineKeyboardButton(f"📤 طريقة الإرسال: {cur_label}", callback_data="cycle_method")],
             [InlineKeyboardButton("📝 تعديل نص البلاغ", callback_data="edit_template")],
-            [InlineKeyboardButton(f"⏳ التأخير: {s.get('min_delay', 25)}-{s.get('max_delay', 90)} ث", callback_data="edit_delays")],
+            [InlineKeyboardButton(f"⏳ المدة بين كل إرسال: {between_sec} ث", callback_data="edit_between_delay")],
             [InlineKeyboardButton("🔙 رجوع", callback_data="back_main")],
         ]
         await q.edit_message_text(
@@ -419,9 +434,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("📝 أرسل نص البلاغ الأساسي الجديد:")
         return
 
-    if data == "edit_delays":
-        USER_STATES[chat_id] = {"step": "edit_delays"}
-        await q.edit_message_text("⏳ أرسل أقل وأقصى مدة انتظار بالثواني (مثال: 25 90):")
+    if data == "edit_between_delay":
+        USER_STATES[chat_id] = {"step": "edit_between_delay"}
+        await q.edit_message_text("⏳ أرسل المدة بين كل إرسال بالثواني (مثال: 30 أو 0 لعدم الانتظار):")
         return
 
     if data == "menu_stats":
@@ -567,7 +582,7 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             core.save_settings(s)
             USER_STATES.pop(chat_id, None)
             await update.message.reply_text(
-                f"✅ تم ضبط الفاصل الزمني إلى {mins} دقيقة.",
+                f"✅ تم ضبط الفاصل الزمني للإرسال التلقائي إلى {mins} دقيقة.",
                 reply_markup=build_main_menu(),
             )
         except ValueError:
@@ -582,35 +597,49 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("✅ تم تحديث نص البلاغ.", reply_markup=build_main_menu())
         return
 
-    if step == "edit_delays":
+    if step == "edit_between_delay":
         try:
-            p1, p2 = map(int, text.split())
+            parts = text.split()
+            if len(parts) >= 2:
+                sec = max(0, int((int(parts[0]) + int(parts[1])) / 2))
+            else:
+                sec = max(0, int(parts[0]))
             s = core.load_settings()
-            s["min_delay"] = min(p1, p2)
-            s["max_delay"] = max(p1, p2)
+            s["between_accounts_delay"] = sec
             core.save_settings(s)
             USER_STATES.pop(chat_id, None)
             await update.message.reply_text(
-                f"✅ تم ضبط التأخير إلى {s['min_delay']}–{s['max_delay']} ثانية.",
+                f"✅ تم ضبط المدة بين كل إرسال إلى {sec} ثانية.",
                 reply_markup=build_main_menu(),
             )
         except Exception:
-            await update.message.reply_text("❌ أرسل رقمين مفصولين بمسافة (مثال: 25 90).")
+            await update.message.reply_text("❌ يرجى إدخال رقم صحيح بالثواني (مثال: 30 أو 0).")
         return
 
 
 async def execute_login_only(bot, chat_id, account):
+    account = await core.ensure_account_session_identity(account)
+
     async def cb(email, ctype, shot, prompt_txt):
         return await send_challenge_to_telegram(bot, chat_id, email, ctype, shot, prompt_txt)
 
+    driver = None
     try:
-        ok, msg = await core.login_account_browser(account, cb)
+        driver = core._build_chrome_driver(account)
+        ok, msg = await core._interactive_google_login(driver, account, cb)
         if ok:
+            core.extract_and_save_profile_names(driver, account)
             await bot.send_message(chat_id, f"✅ تم تسجيل الدخول بنجاح: {account['email']}")
         else:
             await bot.send_message(chat_id, f"❌ تعذر تسجيل الدخول ({account['email']}): {msg}")
     except Exception as e:
         await bot.send_message(chat_id, f"❌ حدث خطأ: {core._format_exc(e)}")
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
 
 
 async def execute_report_task(bot, chat_id, account, force_method=None):
@@ -630,7 +659,8 @@ async def execute_report_task(bot, chat_id, account, force_method=None):
     )
     core.record_stat(account["email"], ok, used_channel, report["subject"])
     if ok:
-        core.update_account(account["email"], sent=account.get("sent", 0) + 1, last_status="تم الإرسال ✅")
+        latest = core.get_account(account["email"]) or account
+        core.update_account(account["email"], sent=latest.get("sent", 0) + 1, last_status="تم الإرسال ✅")
         await bot.send_message(
             chat_id,
             f"✅ تم إرسال البلاغ بنجاح\n"
@@ -645,7 +675,51 @@ async def execute_report_task(bot, chat_id, account, force_method=None):
         )
 
 
+async def execute_all_accounts_task(bot, chat_id, accounts, delay_sec):
+    async with AUTO_BATCH_LOCK:
+        success_count = 0
+        fail_count = 0
+        total = len(accounts)
+
+        for idx, acc in enumerate(accounts):
+            s = core.load_settings()
+            method = s.get("send_method", "auto")
+            report = await core.generate_report()
+
+            async def cb(email, ctype, shot, prompt_txt):
+                return await send_challenge_to_telegram(bot, chat_id, email, ctype, shot, prompt_txt)
+
+            ok, info, used_channel = await core.dispatch_report(
+                acc,
+                report["subject"],
+                report["body"],
+                method=method,
+                challenge_callback=cb,
+            )
+            core.record_stat(acc["email"], ok, used_channel, report["subject"])
+            if ok:
+                latest = core.get_account(acc["email"]) or acc
+                core.update_account(acc["email"], sent=latest.get("sent", 0) + 1, last_status="تم الإرسال ✅")
+                success_count += 1
+            else:
+                core.update_account(acc["email"], last_status="فشل الإرسال ❌")
+                fail_count += 1
+
+            if idx < total - 1 and delay_sec > 0:
+                await asyncio.sleep(delay_sec)
+
+        if chat_id is not None:
+            await bot.send_message(
+                chat_id,
+                f"📊 اكتمل الإرسال بكل الحسابات\n"
+                f"• ناجح: {success_count}\n"
+                f"• فاشل: {fail_count}",
+            )
+
+
 async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
+    if AUTO_BATCH_LOCK.locked():
+        return
     s = core.load_settings()
     if not s.get("auto_send_enabled"):
         return
@@ -658,16 +732,8 @@ async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     LAST_AUTO_RUN["ts"] = now
-    acc = random.choice(accounts)
-    report = await core.generate_report()
-    method = s.get("send_method", "auto")
-    ok, _, used_channel = await core.dispatch_report(acc, report["subject"], report["body"], method=method)
-    core.record_stat(acc["email"], ok, used_channel, report["subject"])
-    if ok:
-        core.update_account(acc["email"], sent=acc.get("sent", 0) + 1, last_status="تم الإرسال ✅")
-
-    delay = random.randint(s.get("min_delay", 25), s.get("max_delay", 90))
-    await asyncio.sleep(delay)
+    delay_sec = max(0, int(s.get("between_accounts_delay", 30)))
+    await execute_all_accounts_task(context.bot, None, accounts, delay_sec)
 
 
 def main():
