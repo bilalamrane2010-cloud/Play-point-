@@ -190,7 +190,8 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📖 الأوامر المتاحة\n"
         "• /start لوحة التحكم\n"
         "• /status حالة الإرسال القادم\n"
-        "• /cancel إلغاء أي عملية جارية\n\n"
+        "• /cancel إلغاء أي عملية جارية\n"
+        "• /selftest فحص شامل لكل مكوّنات البوت\n\n"
         "الفاصل الأدنى بين كل إرسال والذي يليه هو 6 ساعات لكل الحسابات، "
         "ويمكن زيادته من الإعدادات.",
         reply_markup=build_main_menu(),
@@ -200,6 +201,94 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @restricted
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(render_dashboard(), reply_markup=build_main_menu())
+
+
+@restricted
+async def cmd_selftest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """End-to-end self test that runs inside Telegram and reports back."""
+    await update.message.reply_text("🧪 جارٍ فحص كل مكوّنات البوت... قد يستغرق حتى دقيقة.")
+
+    lines: list[str] = []
+    passed = 0
+    failed = 0
+
+    def add(ok: bool, label: str, detail: str = "") -> None:
+        nonlocal passed, failed
+        if ok:
+            passed += 1
+            lines.append(f"✅ {label}" + (f" — {detail}" if detail else ""))
+        else:
+            failed += 1
+            lines.append(f"❌ {label}" + (f" — {detail}" if detail else ""))
+
+    # 1. Telegram connectivity
+    try:
+        me = await context.bot.get_me()
+        add(True, "الاتصال بتلغرام", f"@{me.username}")
+    except Exception as exc:  # noqa: BLE001
+        add(False, "الاتصال بتلغرام", core._format_exc(exc)[:120])
+
+    # 2. Accounts
+    accounts = core.load_accounts()
+    add(bool(accounts), "الحسابات المسجّلة", f"{len(accounts)} حساب")
+
+    # 3. Anti-spam interval
+    settings = core.load_settings()
+    interval_h = core.send_interval_seconds(settings) / 3600
+    add(
+        core.send_interval_seconds(settings) >= core.MIN_SEND_INTERVAL_SECONDS,
+        "الفاصل الإجباري بين الإرسال",
+        f"{interval_h:g} ساعة (الحد الأدنى 6)",
+    )
+
+    # 4. Email transport configuration
+    transport = core._email_transport()
+    providers = core._https_email_providers()
+    has_https = any(providers.values())
+    add(
+        has_https or transport == "smtp",
+        "قناة البريد",
+        _transport_label(),
+    )
+
+    # 5. Chromium (needed for the web login / GetHelp form)
+    chrome = core._resolve_chrome_binary()
+    add(bool(chrome), "متصفح Chromium", chrome or "غير موجود")
+
+    # 6. AI report generation
+    try:
+        report = await asyncio.wait_for(core.generate_report(), timeout=60)
+        add(
+            bool(report.get("body")),
+            "توليد البلاغ بالذكاء الاصطناعي",
+            f"{len(report.get('body', ''))} حرف",
+        )
+    except Exception as exc:  # noqa: BLE001
+        add(False, "توليد البلاغ بالذكاء الاصطناعي", core._format_exc(exc)[:120])
+
+    # 7. Live delivery test per account
+    for account in accounts[:3]:
+        email = account.get("email", "?")
+        has_pw = bool((account.get("app_password") or "").strip())
+        if not has_pw and not has_https:
+            add(False, f"بيانات {email}", "لا App Password ولا قناة HTTPS")
+            continue
+        try:
+            ok, info = await asyncio.wait_for(
+                asyncio.to_thread(core.test_smtp, account), timeout=45
+            )
+            add(ok, f"الإرسال من {email}", info[:160])
+        except Exception as exc:  # noqa: BLE001
+            add(False, f"الإرسال من {email}", core._format_exc(exc)[:120])
+
+    header = "🧪 نتيجة الفحص الشامل\n" + "─" * 14 + "\n"
+    footer = (
+        "\n" + "─" * 14 + f"\n✅ نجح: {passed}   ❌ فشل: {failed}\n"
+        + ("🎉 كل شيء يعمل!" if failed == 0 else "⚠️ راجع العناصر الفاشلة أعلاه.")
+    )
+    await update.message.reply_text(
+        header + "\n".join(lines) + footer, reply_markup=build_main_menu()
+    )
 
 
 @restricted
@@ -929,6 +1018,7 @@ def build_application(token: str) -> Application:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("selftest", cmd_selftest))
     app.add_handler(CallbackQueryHandler(callback_router))
     app.add_handler(MessageHandler(filters.Document.ALL, document_input_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input_handler))
