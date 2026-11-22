@@ -1782,6 +1782,15 @@ async def send_via_gmail_web(account: dict, to_email: str, subject: str, body: s
 # Dispatch
 # ---------------------------------------------------------------------------
 
+def _can_use_web_form(account: dict) -> bool:
+    """True when the account has enough data to drive the Google web form."""
+    return bool(
+        account.get("logged_in")
+        or account.get("password")
+        or account.get("cookies")
+    )
+
+
 async def dispatch_report(
     account: dict,
     subject: str,
@@ -1807,7 +1816,16 @@ async def dispatch_report(
 
     if method == "smtp":
         ok, info = await asyncio.to_thread(send_via_smtp, account, target_email, subject, body)
-        return ok, info, "smtp"
+        if ok:
+            return True, info, "smtp"
+        # Railway/PaaS block outbound SMTP. When the failure is the firewall and
+        # we have a browser session, fall back to the official Google web form.
+        if _is_network_blocked(info) and _can_use_web_form(account):
+            ok2, info2 = await send_via_gethelp_form(account, body, challenge_callback)
+            if ok2:
+                return True, info2, "web_form"
+            return False, f"{info} | {info2}", "smtp"
+        return False, info, "smtp"
 
     if method == "gmail_web":
         ok, info = await send_via_gmail_web(account, target_email, subject, body, challenge_callback)
@@ -1821,5 +1839,12 @@ async def dispatch_report(
         return await _smtp_fallback(info)
     if has_smtp:
         ok, info = await asyncio.to_thread(send_via_smtp, account, target_email, subject, body)
-        return ok, info, "smtp"
+        if ok:
+            return True, info, "smtp"
+        if _is_network_blocked(info) and _can_use_web_form(account):
+            ok2, info2 = await send_via_gethelp_form(account, body, challenge_callback)
+            if ok2:
+                return True, info2, "web_form"
+            return False, f"{info} | {info2}", "smtp"
+        return False, info, "smtp"
     return False, "No valid credentials for account", method
