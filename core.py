@@ -38,7 +38,7 @@ REAL_DEVICES_POOL = [
         "device_id": "SM-S928B-98241",
         "android_version": "14",
         "build_id": "UP1A.231005.007",
-        "screen_res": "1440x3120",
+        "screen_res": "412x915",
         "timezone": "Africa/Algiers",
         "locale": "en-US",
         "ip_address": "105.104.22.14",
@@ -49,7 +49,7 @@ REAL_DEVICES_POOL = [
         "device_id": "PIXEL-9PXL-55109",
         "android_version": "15",
         "build_id": "AP3A.240905.015",
-        "screen_res": "1344x2992",
+        "screen_res": "412x915",
         "timezone": "Africa/Algiers",
         "locale": "en-US",
         "ip_address": "105.104.48.91",
@@ -60,7 +60,7 @@ REAL_DEVICES_POOL = [
         "device_id": "22101316I-73024",
         "android_version": "14",
         "build_id": "UKQ1.231003.002",
-        "screen_res": "1080x2400",
+        "screen_res": "393x873",
         "timezone": "Africa/Algiers",
         "locale": "en-US",
         "ip_address": "105.105.19.63",
@@ -71,24 +71,15 @@ REAL_DEVICES_POOL = [
         "device_id": "OP-PJZ110-61982",
         "android_version": "15",
         "build_id": "AP3A.240617.008",
-        "screen_res": "1440x3168",
+        "screen_res": "412x915",
         "timezone": "Africa/Algiers",
         "locale": "en-US",
         "ip_address": "105.104.87.32",
         "user_agent": "Mozilla/5.0 (Linux; Android 15; PJZ110) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.6723.106 Mobile Safari/537.36",
     },
-    {
-        "device_name": "iPhone 16 Pro Max",
-        "device_id": "IPHONE17-2-84712",
-        "android_version": "iOS 18.1",
-        "build_id": "22B83",
-        "screen_res": "1320x2868",
-        "timezone": "Africa/Algiers",
-        "locale": "en-US",
-        "ip_address": "105.105.64.108",
-        "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) CriOS/131.0.6778.134 Mobile/15E148 Safari/604.1",
-    },
 ]
+
+_BROWSER_LOCK = asyncio.Lock()
 
 
 def _format_exc(exc):
@@ -101,17 +92,22 @@ def _format_exc(exc):
     return f"{type(exc).__name__}: {raw}" if not raw.startswith(type(exc).__name__) else raw
 
 
-def _is_tab_crash_error(err_or_exc):
+def _is_browser_crash_error(err_or_exc):
     msg = str(err_or_exc).lower()
     return any(
         token in msg
         for token in (
             "tab crashed",
+            "target page, context or browser has been closed",
+            "target closed",
+            "browser has been closed",
             "target frame detached",
             "disconnected",
             "session deleted because of page crash",
             "chrome not reachable",
             "renderer process crashed",
+            "connection refused",
+            "maxretryerror",
         )
     )
 
@@ -259,16 +255,23 @@ def import_cookies_for_account(email, raw_json_str):
         for c in parsed:
             if not isinstance(c, dict) or not c.get("name") or not c.get("value"):
                 continue
+            same_site = str(c.get("sameSite") or "Lax").capitalize()
+            if same_site not in ("Strict", "Lax", "None"):
+                same_site = "Lax"
             item = {
                 "name": str(c["name"]),
                 "value": str(c["value"]),
                 "domain": str(c.get("domain") or ".google.com"),
                 "path": str(c.get("path") or "/"),
+                "secure": bool(c.get("secure", True)),
+                "httpOnly": bool(c.get("httpOnly", False)),
+                "sameSite": same_site,
             }
-            if c.get("secure") is not None:
-                item["secure"] = bool(c["secure"])
-            if c.get("httpOnly") is not None:
-                item["httpOnly"] = bool(c["httpOnly"])
+            if c.get("expirationDate"):
+                try:
+                    item["expires"] = float(c["expirationDate"])
+                except Exception:
+                    pass
             cleaned.append(item)
         if not cleaned:
             return False, "لا توجد كوكيز صالحة داخل الملف"
@@ -499,35 +502,13 @@ def _resolve_chrome_binary():
     return None
 
 
-def _resolve_chromedriver_path():
-    env_drv = os.getenv("CHROMEDRIVER_PATH", "").strip()
-    if env_drv and os.path.exists(env_drv):
-        return env_drv
-    for name in ("chromedriver",):
-        p = shutil.which(name)
-        if p and os.path.exists(p):
-            return p
-    from webdriver_manager.chrome import ChromeDriverManager
-    return ChromeDriverManager().install()
-
-
-def _detect_chrome_major_version(chrome_bin):
-    try:
-        out = subprocess.check_output([chrome_bin, "--version"], stderr=subprocess.STDOUT, text=True, timeout=5)
-        for part in out.strip().split():
-            major = part.split(".", 1)[0]
-            if major.isdigit():
-                return int(major)
-    except Exception:
-        pass
-    return None
-
-
 def _parse_resolution(res_str):
     try:
         w_str, h_str = str(res_str).lower().split("x", 1)
         w, h = int(w_str.strip()), int(h_str.strip())
         if 300 <= w <= 2560 and 500 <= h <= 4000:
+            if w > 600:
+                return 412, 915
             return w, h
     except Exception:
         pass
@@ -547,13 +528,7 @@ def _clean_stale_profile_locks(prof_dir):
 def _cleanup_stray_browser_processes():
     try:
         subprocess.run(
-            ["pkill", "-9", "-f", "chromium|chrome"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
-        )
-        subprocess.run(
-            ["pkill", "-9", "-f", "chromedriver"],
+            ["pkill", "-9", "-f", "chromium|chrome|chromedriver"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=2,
@@ -570,68 +545,14 @@ def _get_proxy_url():
     return ""
 
 
-def _inject_saved_cookies(driver, account):
-    cookies = account.get("cookies") or []
-    if not cookies:
-        return False
-    try:
-        driver.get("https://accounts.google.com/robots.txt")
-        time.sleep(0.5)
-        injected = 0
-        for c in cookies:
-            cookie_dict = {
-                "name": c["name"],
-                "value": c["value"],
-                "domain": c.get("domain", ".google.com"),
-                "path": c.get("path", "/"),
-            }
-            try:
-                driver.add_cookie(cookie_dict)
-                injected += 1
-            except Exception:
-                pass
-        return injected > 0
-    except Exception:
-        return False
-
-
-def _save_driver_cookies(driver, account):
-    try:
-        raw_cookies = driver.get_cookies() or []
-        google_cookies = [
-            {
-                "name": c["name"],
-                "value": c["value"],
-                "domain": c.get("domain", ".google.com"),
-                "path": c.get("path", "/"),
-                "secure": bool(c.get("secure", True)),
-                "httpOnly": bool(c.get("httpOnly", False)),
-            }
-            for c in raw_cookies
-            if "google" in (c.get("domain") or "")
-        ]
-        if google_cookies:
-            update_account(account["email"], cookies=google_cookies)
-    except Exception:
-        pass
-
-
-def _build_chrome_driver(account):
-    chrome_bin = _resolve_chrome_binary()
-    if not chrome_bin:
-        raise RuntimeError("Chrome/Chromium not installed in container")
-
+async def _launch_playwright_context(pw, account):
     prof_dir = account.get("profile_dir") or os.path.join(
         PROFILES_DIR, account["email"].replace("@", "_at_").replace(".", "_")
     )
     os.makedirs(prof_dir, exist_ok=True)
     _clean_stale_profile_locks(prof_dir)
-    _cleanup_stray_browser_processes()
 
-    width, height = _parse_resolution(account.get("screen_res", "1080x2400"))
-    if width > 600:
-        width, height = 412, 915
-
+    width, height = _parse_resolution(account.get("screen_res", "412x915"))
     ua = account.get("user_agent") or (
         "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36"
@@ -642,13 +563,16 @@ def _build_chrome_driver(account):
     dev_id = account.get("device_id") or "DEV-000000"
     ip_addr = account.get("ip_address") or "105.104.22.14"
     proxy_url = _get_proxy_url()
+    chrome_bin = _resolve_chrome_binary()
 
-    low_mem_args = [
+    launch_args = [
         "--no-sandbox",
+        "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
         "--disable-gpu",
         "--disable-software-rasterizer",
-        "--disable-features=VizDisplayCompositor,IsolateOrigins,site-per-process,Translate,BackForwardCache",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-features=IsolateOrigins,site-per-process,Translate,BackForwardCache",
         "--disable-background-networking",
         "--disable-background-timer-throttling",
         "--disable-renderer-backgrounding",
@@ -658,151 +582,98 @@ def _build_chrome_driver(account):
         "--disable-sync",
         "--disable-default-apps",
         "--disable-component-update",
-        "--disable-domain-reliability",
-        "--disable-client-side-phishing-detection",
         "--no-first-run",
         "--no-default-browser-check",
-        "--renderer-process-limit=1",
-        "--disk-cache-size=16777216",
-        "--media-cache-size=8388608",
-        "--metrics-recording-only",
         "--mute-audio",
         "--js-flags=--max-old-space-size=256",
-        f"--window-size={width},{height}",
-        f"--lang={locale}",
-        f"--user-agent={ua}",
     ]
+
+    kwargs = {
+        "user_data_dir": prof_dir,
+        "headless": True,
+        "args": launch_args,
+        "user_agent": ua,
+        "viewport": {"width": width, "height": height},
+        "device_scale_factor": 2.625,
+        "is_mobile": True,
+        "has_touch": True,
+        "locale": locale,
+        "timezone_id": tz,
+        "ignore_https_errors": True,
+    }
+    if chrome_bin:
+        kwargs["executable_path"] = chrome_bin
     if proxy_url:
-        low_mem_args.append(f"--proxy-server={proxy_url}")
+        kwargs["proxy"] = {"server": proxy_url}
 
-    major_ver = _detect_chrome_major_version(chrome_bin)
-    driver = None
+    context = await pw.chromium.launch_persistent_context(**kwargs)
 
+    await context.add_init_script(
+        f"""
+        Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+        Object.defineProperty(navigator, 'platform', {{ get: () => 'Linux armv8l' }});
+        Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => 8 }});
+        Object.defineProperty(navigator, 'deviceMemory', {{ get: () => 8 }});
+        window.chrome = window.chrome || {{ runtime: {{}} }};
+        window.__DEVICE_IDENTITY__ = {{
+            deviceName: {json.dumps(dev_name)},
+            deviceId: {json.dumps(dev_id)},
+            ipAddress: {json.dumps(ip_addr)}
+        }};
+        """
+    )
+
+    async def _route_interceptor(route):
+        rtype = route.request.resource_type
+        url = route.request.url.lower()
+        if rtype in ("media", "font") or any(
+            bad in url for bad in ("doubleclick.net", "google-analytics.com", "googletagmanager.com")
+        ):
+            await route.abort()
+        else:
+            await route.continue_()
+
+    await context.route("**/*", _route_interceptor)
+
+    saved_cookies = account.get("cookies") or []
+    if saved_cookies:
+        try:
+            await context.add_cookies(saved_cookies)
+        except Exception:
+            pass
+
+    page = context.pages[0] if context.pages else await context.new_page()
+    page.set_default_timeout(20000)
+    page.set_default_navigation_timeout(25000)
+    return context, page
+
+
+async def _save_context_cookies(context, account):
     try:
-        import undetected_chromedriver as uc
-
-        uc_opts = uc.ChromeOptions()
-        uc_opts.binary_location = chrome_bin
-        uc_opts.user_data_dir = prof_dir
-        uc_opts.add_argument("--profile-directory=Default")
-        for arg in low_mem_args:
-            uc_opts.add_argument(arg)
-
-        uc_kwargs = {
-            "options": uc_opts,
-            "browser_executable_path": chrome_bin,
-            "headless": True,
-            "use_subprocess": True,
-        }
-        if major_ver:
-            uc_kwargs["version_main"] = major_ver
-
-        driver = uc.Chrome(**uc_kwargs)
-    except Exception as uc_err:
-        logging.warning(f"undetected_chromedriver fallback: {_format_exc(uc_err)}")
-        from selenium import webdriver
-        from selenium.webdriver.chrome.service import Service
-
-        opts = webdriver.ChromeOptions()
-        opts.binary_location = chrome_bin
-        opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-        opts.add_experimental_option("useAutomationExtension", False)
-        opts.add_argument("--remote-debugging-pipe")
-        opts.add_argument("--headless=new")
-        opts.add_argument(f"--user-data-dir={prof_dir}")
-        opts.add_argument("--profile-directory=Default")
-        for arg in low_mem_args:
-            opts.add_argument(arg)
-
-        driver_path = _resolve_chromedriver_path()
-        driver = webdriver.Chrome(service=Service(driver_path), options=opts)
-
-    try:
-        driver.set_page_load_timeout(25)
-        driver.set_script_timeout(15)
-        driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {
-                "source": f"""
-                    Object.defineProperty(navigator, 'webdriver', {{get: () => undefined}});
-                    Object.defineProperty(navigator, 'platform', {{get: () => 'Linux armv8l'}});
-                    Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => 8}});
-                    Object.defineProperty(navigator, 'deviceMemory', {{get: () => 8}});
-                    window.__DEVICE_IDENTITY__ = {{
-                        deviceName: {json.dumps(dev_name)},
-                        deviceId: {json.dumps(dev_id)},
-                        ipAddress: {json.dumps(ip_addr)}
-                    }};
-                """
-            },
-        )
-        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": tz})
-        driver.execute_cdp_cmd(
-            "Emulation.setDeviceMetricsOverride",
-            {
-                "width": width,
-                "height": height,
-                "deviceScaleFactor": 2.625,
-                "mobile": True,
-            },
-        )
-        driver.execute_cdp_cmd("Network.enable", {})
-        driver.execute_cdp_cmd(
-            "Network.setBlockedURLs",
-            {
-                "urls": [
-                    "*.png",
-                    "*.jpg",
-                    "*.jpeg",
-                    "*.gif",
-                    "*.webp",
-                    "*.mp4",
-                    "*.woff",
-                    "*.woff2",
-                    "*doubleclick.net*",
-                    "*google-analytics.com*",
-                    "*googletagmanager.com*",
-                ]
-            },
-        )
-    except Exception:
-        pass
-
-    return driver
-
-
-def _close_extra_tabs(driver):
-    try:
-        handles = list(driver.window_handles)
-        if len(handles) > 1:
-            keep = handles[0]
-            for h in handles[1:]:
-                try:
-                    driver.switch_to.window(h)
-                    driver.close()
-                except Exception:
-                    pass
-            driver.switch_to.window(keep)
+        cookies = await context.cookies()
+        google_cookies = [c for c in cookies if "google" in (c.get("domain") or "")]
+        if google_cookies:
+            update_account(account["email"], cookies=google_cookies)
     except Exception:
         pass
 
 
-def _capture_screenshot(driver, email):
+async def _capture_pw_screenshot(page, email):
     _ensure_storage()
-    time.sleep(0.4)
     fname = f"{email.replace('@', '_')}_{int(time.time())}.png"
     path = os.path.join(SCREENSHOTS_DIR, fname)
     try:
-        driver.save_screenshot(path)
+        await page.screenshot(path=path, full_page=False)
         return path
     except Exception:
         return None
 
 
-def _is_insecure_browser_block(driver):
+async def _is_insecure_browser_block_pw(page):
     try:
-        txt = ((driver.title or "") + " " + (driver.page_source or "")).lower()
+        title = (await page.title()) or ""
+        body_txt = await page.inner_text("body")
+        txt = f"{title} {body_txt}".lower()
         return (
             "couldn't sign you in" in txt
             or "this browser or app may not be secure" in txt
@@ -813,89 +684,43 @@ def _is_insecure_browser_block(driver):
         return False
 
 
-def _has_real_captcha_challenge(driver):
+async def _has_real_captcha_pw(page):
     try:
-        from selenium.webdriver.common.by import By
-
-        if _is_insecure_browser_block(driver):
+        if await _is_insecure_browser_block_pw(page):
             return False
-
-        pwd_boxes = [
-            p for p in driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='Passwd']")
-            if p.is_displayed()
-        ]
-        if pwd_boxes:
+        pwd_loc = page.locator("input[type='password'], input[name='Passwd']")
+        if await pwd_loc.count() > 0 and await pwd_loc.first.is_visible():
             return False
-
-        page_txt = ((driver.title or "") + " " + (driver.page_source or "")).lower()
-        if "enter your password" in page_txt or "show password" in page_txt:
-            return False
-
-        cur = (driver.current_url or "").lower()
+        cur = (page.url or "").lower()
         if "recaptcha" in cur or "captcha" in cur:
             return True
-
-        frames = [
-            fr for fr in driver.find_elements(
-                By.CSS_SELECTOR,
-                "iframe[src*='recaptcha'], iframe[title*='recaptcha' i], iframe[src*='captcha']",
-            )
-            if fr.is_displayed()
-        ]
-        if frames:
+        cap_frame = page.locator("iframe[src*='recaptcha'], iframe[title*='recaptcha' i], iframe[src*='captcha']")
+        if await cap_frame.count() > 0 and await cap_frame.first.is_visible():
             return True
-
-        imgs = [
-            im for im in driver.find_elements(
-                By.CSS_SELECTOR,
-                "img[src*='captcha'], img[alt*='captcha' i], img[src*='challenge']",
-            )
-            if im.is_displayed()
-        ]
-        if imgs:
+        cap_img = page.locator("img[src*='captcha'], img[alt*='captcha' i], img[src*='challenge']")
+        if await cap_img.count() > 0 and await cap_img.first.is_visible():
             return True
-
         return False
     except Exception:
         return False
 
 
-def _click_next_if_present(driver):
-    try:
-        from selenium.webdriver.common.by import By
-        btns = [
-            b for b in driver.find_elements(
-                By.XPATH,
-                "//button[contains(., 'Next') or contains(., 'next') or contains(., 'التالي') or @id='identifierNext' or @id='passwordNext'] | "
-                "//div[@role='button'][contains(., 'Next') or contains(., 'التالي')]",
-            )
-            if b.is_displayed() and b.is_enabled()
-        ]
-        if btns:
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btns[0])
-            time.sleep(0.15)
-            try:
-                btns[0].click()
-            except Exception:
-                driver.execute_script("arguments[0].click();", btns[0])
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def extract_and_save_profile_names(driver, account):
+async def _extract_profile_names_pw(page, account):
     first_name = (account.get("first_name") or "").strip()
     last_name = (account.get("last_name") or "").strip()
-
     if first_name and last_name and first_name != "Play":
         return first_name, last_name
 
     try:
-        driver.get("https://myaccount.google.com/profile/name?hl=en")
-        time.sleep(1.2)
-        inputs = driver.find_elements("css selector", "input[type='text']")
-        vals = [i.get_attribute("value").strip() for i in inputs if i.get_attribute("value")]
+        await page.goto("https://myaccount.google.com/profile/name?hl=en", wait_until="domcontentloaded")
+        await asyncio.sleep(1.0)
+        inputs = page.locator("input[type='text']")
+        cnt = await inputs.count()
+        vals = []
+        for i in range(cnt):
+            v = (await inputs.nth(i).input_value()).strip()
+            if v:
+                vals.append(v)
         if len(vals) >= 2:
             first_name, last_name = vals[0], vals[1]
             update_account(account["email"], first_name=first_name, last_name=last_name)
@@ -913,58 +738,44 @@ def extract_and_save_profile_names(driver, account):
         first_name = first_name or inf_f
         last_name = last_name or inf_l
         update_account(account["email"], first_name=first_name, last_name=last_name)
-
     return first_name, last_name
 
 
-async def _interactive_google_login(driver, account, challenge_callback=None, timeout=180):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.support.ui import WebDriverWait
+async def _interactive_google_login_pw(context, page, account, challenge_callback=None, timeout=180):
+    await page.goto("https://myaccount.google.com/?hl=en", wait_until="domcontentloaded")
+    await asyncio.sleep(1.2)
 
-    try:
-        driver.set_page_load_timeout(25)
-    except Exception:
-        pass
-
-    _inject_saved_cookies(driver, account)
-
-    driver.get("https://myaccount.google.com/?hl=en")
-    await asyncio.sleep(1.5)
-    _close_extra_tabs(driver)
-
-    if "myaccount.google.com" in driver.current_url and "signin" not in driver.current_url:
-        _save_driver_cookies(driver, account)
-        extract_and_save_profile_names(driver, account)
+    if "myaccount.google.com" in page.url and "signin" not in page.url:
+        await _save_context_cookies(context, account)
+        await _extract_profile_names_pw(page, account)
         update_account(account["email"], logged_in=True, last_status="جلسة نشطة ✅")
         return True, "Logged in"
 
-    if _is_insecure_browser_block(driver):
+    if await _is_insecure_browser_block_pw(page):
         update_account(account["email"], logged_in=False, last_status="محظور من المتصفح")
         return False, "Browser sign-in blocked by Google"
 
-    driver.get("https://accounts.google.com/signin/v2/identifier?hl=en")
+    await page.goto("https://accounts.google.com/signin/v2/identifier?hl=en", wait_until="domcontentloaded")
     try:
-        email_input = WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.ID, "identifierId"))
-        )
-        email_input.clear()
-        email_input.send_keys(account["email"])
-        email_input.send_keys(Keys.ENTER)
-        await asyncio.sleep(1.0)
-        if "identifierId" in (driver.page_source or "") and len(driver.find_elements(By.CSS_SELECTOR, "input[type='password'], input[name='Passwd']")) == 0:
-            _click_next_if_present(driver)
-        await asyncio.sleep(1.5)
+        email_input = page.locator("#identifierId, input[type='email']").first
+        await email_input.wait_for(state="visible", timeout=15000)
+        await email_input.fill(account["email"])
+        await email_input.press("Enter")
+        await asyncio.sleep(1.2)
+        if await email_input.is_visible():
+            next_btn = page.locator("#identifierNext, button:has-text('Next'), button:has-text('التالي')").first
+            if await next_btn.count() > 0:
+                await next_btn.click()
+                await asyncio.sleep(1.2)
     except Exception as e:
         return False, f"Failed to enter email: {_format_exc(e)}"
 
-    if _is_insecure_browser_block(driver):
+    if await _is_insecure_browser_block_pw(page):
         update_account(account["email"], logged_in=False, last_status="محظور من المتصفح")
         return False, "Browser sign-in blocked by Google"
 
-    if _has_real_captcha_challenge(driver) and challenge_callback:
-        shot = _capture_screenshot(driver, account["email"])
+    if await _has_real_captcha_pw(page) and challenge_callback:
+        shot = await _capture_pw_screenshot(page, account["email"])
         code = await challenge_callback(
             account["email"],
             "captcha",
@@ -974,47 +785,38 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         if not code or str(code).strip().lower() == "/cancel":
             return False, "Cancelled by user"
         try:
-            cap_box = driver.find_element(By.CSS_SELECTOR, "input[type='text']")
-            cap_box.send_keys(str(code).strip())
-            cap_box.send_keys(Keys.ENTER)
+            cap_box = page.locator("input[type='text']").first
+            await cap_box.fill(str(code).strip())
+            await cap_box.press("Enter")
             await asyncio.sleep(1.5)
         except Exception:
             pass
 
     try:
-        pwd_input = WebDriverWait(driver, 12).until(
-            lambda d: next(
-                (
-                    el for el in d.find_elements(By.CSS_SELECTOR, "input[name='Passwd'], input[type='password']")
-                    if el.is_displayed() and el.is_enabled()
-                ),
-                None,
+        pwd_input = page.locator("input[name='Passwd'], input[type='password']").first
+        await pwd_input.wait_for(state="visible", timeout=12000)
+        pwd_to_use = (account.get("password") or "").strip()
+        if not pwd_to_use and challenge_callback:
+            shot = await _capture_pw_screenshot(page, account["email"])
+            reply = await challenge_callback(
+                account["email"],
+                "password",
+                shot,
+                "أرسل كلمة مرور الحساب أو /cancel:",
             )
-        )
-        if pwd_input:
-            pwd_to_use = (account.get("password") or "").strip()
-            if not pwd_to_use and challenge_callback:
-                shot = _capture_screenshot(driver, account["email"])
-                reply = await challenge_callback(
-                    account["email"],
-                    "password",
-                    shot,
-                    "أرسل كلمة مرور الحساب أو /cancel:",
-                )
-                if reply and str(reply).strip().lower() != "/cancel" and str(reply).strip().lower() not in ("done", "ok"):
-                    pwd_to_use = str(reply).strip()
-            if not pwd_to_use:
-                return False, "Account password not provided"
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", pwd_input)
-            time.sleep(0.15)
-            pwd_input.click()
-            pwd_input.clear()
-            pwd_input.send_keys(pwd_to_use)
-            pwd_input.send_keys(Keys.ENTER)
-            await asyncio.sleep(0.9)
-            if driver.find_elements(By.CSS_SELECTOR, "input[name='Passwd'], input[type='password']"):
-                _click_next_if_present(driver)
-            await asyncio.sleep(1.5)
+            if reply and str(reply).strip().lower() not in ("/cancel", "done", "ok"):
+                pwd_to_use = str(reply).strip()
+        if not pwd_to_use:
+            return False, "Account password not provided"
+
+        await pwd_input.fill(pwd_to_use)
+        await pwd_input.press("Enter")
+        await asyncio.sleep(1.0)
+        if await pwd_input.is_visible():
+            pnext = page.locator("#passwordNext, button:has-text('Next'), button:has-text('التالي')").first
+            if await pnext.count() > 0:
+                await pnext.click()
+                await asyncio.sleep(1.2)
     except Exception:
         pass
 
@@ -1022,13 +824,13 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
     challenge_task = None
     start = time.time()
     while time.time() - start < timeout:
-        if _is_insecure_browser_block(driver):
+        if await _is_insecure_browser_block_pw(page):
             if challenge_task and not challenge_task.done():
                 challenge_task.cancel()
             update_account(account["email"], logged_in=False, last_status="محظور من المتصفح")
             return False, "Browser sign-in blocked by Google"
 
-        cur = driver.current_url or ""
+        cur = page.url or ""
         if (
             ("myaccount.google.com" in cur or "mail.google.com" in cur or "support.google.com" in cur)
             and "signin" not in cur
@@ -1036,16 +838,16 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         ):
             if challenge_task and not challenge_task.done():
                 challenge_task.cancel()
-            await asyncio.sleep(0.6)
-            _save_driver_cookies(driver, account)
-            extract_and_save_profile_names(driver, account)
+            await asyncio.sleep(0.5)
+            await _save_context_cookies(context, account)
+            await _extract_profile_names_pw(page, account)
             update_account(account["email"], logged_in=True, last_status="جلسة نشطة ✅")
             return True, "Logged in"
 
         if "challenge" in cur and not notified_2fa and challenge_callback:
-            await asyncio.sleep(0.6)
+            await asyncio.sleep(0.5)
             notified_2fa = True
-            shot = _capture_screenshot(driver, account["email"])
+            shot = await _capture_pw_screenshot(page, account["email"])
             challenge_task = asyncio.create_task(
                 challenge_callback(
                     account["email"],
@@ -1065,10 +867,9 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
                 return False, "2FA cancelled"
             if user_reply and str(user_reply).strip().lower() not in ("done", "ok", ""):
                 try:
-                    code_input = driver.find_element(By.CSS_SELECTOR, "input[type='tel'], input[type='text'], input[type='number']")
-                    code_input.clear()
-                    code_input.send_keys(str(user_reply).strip())
-                    code_input.send_keys(Keys.ENTER)
+                    code_input = page.locator("input[type='tel'], input[type='text'], input[type='number']").first
+                    await code_input.fill(str(user_reply).strip())
+                    await code_input.press("Enter")
                     await asyncio.sleep(1.2)
                 except Exception:
                     pass
@@ -1121,244 +922,152 @@ async def analyze_gethelp_step_with_ai(step_summary, available_actions, body_tex
     return fallback
 
 
-async def _run_gethelp_form_once(driver, account, body_text, first_name, last_name):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support.ui import Select, WebDriverWait
-
-    def _safe_click(el):
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-        time.sleep(0.15)
-        try:
-            el.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", el)
-
-    def _safe_type(el, val):
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-        time.sleep(0.15)
-        try:
-            el.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", el)
-        try:
-            el.clear()
-        except Exception:
-            pass
-        try:
-            el.send_keys(val)
-        except Exception:
-            driver.execute_script(
-                "arguments[0].value = arguments[1];"
-                "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
-                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
-                el,
-                val,
-            )
-
-    def _visible_elements(css_sel):
-        out = []
-        try:
-            for el in driver.find_elements(By.CSS_SELECTOR, css_sel):
-                try:
-                    if el.is_displayed() and el.is_enabled():
-                        out.append(el)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        return out
-
-    def _wait_any_form_control(timeout=10):
-        try:
-            return WebDriverWait(driver, timeout).until(
-                lambda d: any(
-                    el.is_displayed() and el.is_enabled()
-                    for el in d.find_elements(By.CSS_SELECTOR, "textarea, input[type='text'], input[type='email'], input:not([type])")
-                )
-            )
-        except Exception:
-            return False
-
-    def _click_by_texts(texts_lower):
-        for el in driver.find_elements(By.XPATH, "//button | //div[@role='button'] | //span | //label"):
+async def _run_gethelp_form_pw(page, account, body_text, first_name, last_name):
+    async def _click_by_texts(texts_lower):
+        candidates = page.locator("button, [role='button'], label, span")
+        cnt = await candidates.count()
+        for i in range(min(cnt, 120)):
+            el = candidates.nth(i)
             try:
-                if not el.is_displayed():
+                if not await el.is_visible():
                     continue
-                t = (el.text or "").strip().lower()
-                if not t:
+                txt = ((await el.inner_text()) or "").strip().lower()
+                if not txt or len(txt) > 80:
                     continue
-                if any(k in t for k in texts_lower):
-                    _safe_click(el)
+                if any(k in txt for k in texts_lower):
+                    await el.scroll_into_view_if_needed()
+                    await el.click(timeout=4000)
                     return True
             except Exception:
                 pass
         return False
 
-    def _select_any_dropdown():
-        for sel_el in driver.find_elements(By.TAG_NAME, "select"):
-            try:
-                if not sel_el.is_displayed() or not sel_el.is_enabled():
-                    continue
-                s = Select(sel_el)
-                chosen = False
-                for opt in s.options:
-                    ot = (opt.text or "").strip().lower()
-                    if "google play apps" in ot or "play pass" in ot:
-                        s.select_by_visible_text(opt.text)
-                        chosen = True
-                        break
-                if not chosen and len(s.options) > 1:
-                    s.select_by_index(1)
-            except Exception:
-                pass
-
-    driver.get(f"{GETHELP_URL}?hl=en")
+    await page.goto(f"{GETHELP_URL}?hl=en", wait_until="domcontentloaded")
     await asyncio.sleep(1.5)
-    _close_extra_tabs(driver)
 
-    if _is_insecure_browser_block(driver):
+    if await _is_insecure_browser_block_pw(page):
         raise RuntimeError("Browser sign-in blocked by Google")
 
     try:
-        vis_inputs = WebDriverWait(driver, 12).until(
-            lambda d: [
-                el for el in d.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type])")
-                if el.is_displayed() and el.is_enabled()
-            ]
-        )
-        if vis_inputs:
-            _safe_type(vis_inputs[0], "Play point issues")
-            try:
-                vis_inputs[0].send_keys(Keys.ENTER)
-            except Exception:
-                pass
-            await asyncio.sleep(1.0)
-            _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"])
-            await asyncio.sleep(1.2)
+        issue_inp = page.locator("input[type='text'], input:not([type])").first
+        await issue_inp.wait_for(state="visible", timeout=12000)
+        await issue_inp.fill("Play point issues")
+        await issue_inp.press("Enter")
+        await asyncio.sleep(1.0)
+        await _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"])
+        await asyncio.sleep(1.2)
     except Exception:
         pass
 
-    if not _click_by_texts(["play points issue", "play points", "نقاط play", "رصيد play"]):
-        _click_by_texts(["other", "غير ذلك"])
+    if not await _click_by_texts(["play points issue", "play points", "نقاط play", "رصيد play"]):
+        await _click_by_texts(["other", "غير ذلك"])
     await asyncio.sleep(0.6)
-    _select_any_dropdown()
+
+    selects = page.locator("select")
+    scnt = await selects.count()
+    for i in range(scnt):
+        sel = selects.nth(i)
+        try:
+            if not await sel.is_visible():
+                continue
+            opts = sel.locator("option")
+            ocnt = await opts.count()
+            chosen = False
+            for j in range(ocnt):
+                ot = ((await opts.nth(j).inner_text()) or "").strip().lower()
+                if "google play apps" in ot or "play pass" in ot:
+                    val = await opts.nth(j).get_attribute("value")
+                    if val is not None:
+                        await sel.select_option(value=val)
+                    else:
+                        await sel.select_option(index=j)
+                    chosen = True
+                    break
+            if not chosen and ocnt > 1:
+                await sel.select_option(index=1)
+        except Exception:
+            pass
     await asyncio.sleep(0.6)
 
     for _ in range(4):
-        if _visible_elements("textarea"):
+        if await page.locator("textarea:visible").count() > 0:
             break
-        if _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"]):
+        if await _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"]):
             await asyncio.sleep(1.1)
         else:
             break
 
-    _click_by_texts(["email", "البريد الإلكتروني"])
-    _wait_any_form_control(timeout=10)
-
-    if not _visible_elements("textarea") and not _visible_elements("input[type='text']"):
-        _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"])
-        _wait_any_form_control(timeout=10)
-
-    for e_inp in _visible_elements("input[type='email']"):
-        if not (e_inp.get_attribute("value") or "").strip():
-            _safe_type(e_inp, account["email"])
-
-    vis_text_inputs = _visible_elements("input[type='text'], input:not([type])")
-    for idx, inp in enumerate(vis_text_inputs):
-        cur_val = (inp.get_attribute("value") or "").strip()
-        parent_txt = ""
+    await _click_by_texts(["email", "البريد الإلكتروني"])
+    try:
+        await page.locator("textarea:visible, input[type='text']:visible").first.wait_for(state="visible", timeout=10000)
+    except Exception:
+        await _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"])
         try:
-            parent_txt = (inp.find_element(By.XPATH, "./ancestor::*[self::div or self::section][1]").text or "").lower()
+            await page.locator("textarea:visible, input[type='text']:visible").first.wait_for(state="visible", timeout=10000)
         except Exception:
             pass
-        aria_lbl = (inp.get_attribute("aria-label") or inp.get_attribute("placeholder") or "").lower()
+
+    email_inputs = page.locator("input[type='email']:visible")
+    for i in range(await email_inputs.count()):
+        einp = email_inputs.nth(i)
+        if not (await einp.input_value()).strip():
+            await einp.fill(account["email"])
+
+    text_inputs = page.locator("input[type='text']:visible, input:not([type]):visible")
+    tcnt = await text_inputs.count()
+    for idx in range(tcnt):
+        inp = text_inputs.nth(idx)
+        cur_val = (await inp.input_value()).strip()
+        aria_lbl = ((await inp.get_attribute("aria-label")) or (await inp.get_attribute("placeholder")) or "").lower()
+        parent_txt = ""
+        try:
+            parent_txt = (await inp.locator("xpath=./ancestor::*[self::div or self::section][1]").inner_text()).lower()
+        except Exception:
+            pass
         combined_lbl = f"{parent_txt} {aria_lbl}"
         if "transaction id" in combined_lbl or "order id" in combined_lbl or "gpa." in combined_lbl:
-            _safe_type(inp, "N/A")
+            await inp.fill("N/A")
         elif idx == 0 and not cur_val:
-            _safe_type(inp, first_name)
+            await inp.fill(first_name)
         elif idx == 1 and not cur_val:
-            _safe_type(inp, last_name)
+            await inp.fill(last_name)
         elif not cur_val:
-            _safe_type(inp, "N/A")
+            await inp.fill("N/A")
 
-    vis_areas = _visible_elements("textarea")
-    if vis_areas:
-        _safe_type(vis_areas[0], body_text)
-        await asyncio.sleep(0.5)
+    areas = page.locator("textarea:visible")
+    if await areas.count() > 0:
+        await areas.first.fill(body_text)
+        await asyncio.sleep(0.4)
 
-    visible_btns = [
-        (el.text or "").strip()
-        for el in driver.find_elements(By.XPATH, "//button | //div[@role='button']")
-        if el.is_displayed() and (el.text or "").strip()
-    ]
     _ = await analyze_gethelp_step_with_ai(
         step_summary="Final GetHelp Email form ready for submission after filling Transaction ID='N/A' and issue description.",
-        available_actions=", ".join(visible_btns[:15]),
+        available_actions="Submit",
         body_text=body_text,
         first_name=first_name,
         last_name=last_name,
     )
 
-    try:
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        await asyncio.sleep(0.5)
-    except Exception:
-        pass
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await asyncio.sleep(0.4)
 
-    clicked_submit = _click_by_texts(["submit", "إرسال", "send"])
+    clicked_submit = await _click_by_texts(["submit", "إرسال", "send"])
     if not clicked_submit:
-        for css_sub in (
-            "button[type='submit']",
-            "input[type='submit']",
-            "[aria-label*='submit' i]",
-            "[aria-label*='إرسال' i]",
-            "[aria-label*='send' i]",
-        ):
-            subs = _visible_elements(css_sub)
-            if subs:
-                _safe_click(subs[0])
-                clicked_submit = True
-                break
-    if not clicked_submit:
-        for el in driver.find_elements(By.XPATH, "//button | //div[@role='button'] | //input[@type='button'] | //input[@type='submit']"):
-            try:
-                if not el.is_displayed():
-                    continue
-                blob = ((el.text or "") + " " + (el.get_attribute("aria-label") or "")).strip().lower()
-                if any(k in blob for k in ("submit", "send", "إرسال")):
-                    _safe_click(el)
-                    clicked_submit = True
-                    break
-            except Exception:
-                pass
+        sub_loc = page.locator(
+            "button[type='submit']:visible, input[type='submit']:visible, "
+            "[aria-label*='submit' i]:visible, [aria-label*='إرسال' i]:visible, [aria-label*='send' i]:visible"
+        )
+        if await sub_loc.count() > 0:
+            await sub_loc.first.click()
+            clicked_submit = True
 
     if not clicked_submit:
-        _capture_screenshot(driver, account["email"])
+        await _capture_pw_screenshot(page, account["email"])
         raise RuntimeError("Submit button not found on GetHelp form")
 
-    try:
-        WebDriverWait(driver, 10).until(
-            lambda d: any(
-                phrase in (d.page_source or "").lower()
-                for phrase in (
-                    "we couldn't submit your form yet",
-                    "please fix the fields above",
-                    "thank you",
-                    "submitted",
-                    "sent",
-                    "we've received",
-                    "request received",
-                )
-            )
-        )
-    except Exception:
-        await asyncio.sleep(1.5)
-
-    page_lower = (driver.page_source or "").lower()
+    await asyncio.sleep(2.5)
+    page_lower = (await page.content()).lower()
     if "we couldn't submit your form yet" in page_lower or "please fix the fields above" in page_lower:
-        _capture_screenshot(driver, account["email"])
+        await _capture_pw_screenshot(page, account["email"])
         raise RuntimeError("Form validation error after clicking Submit")
 
     confirmation_markers = (
@@ -1374,89 +1083,105 @@ async def _run_gethelp_form_once(driver, account, body_text, first_name, last_na
         return True, "Submitted via Support Form"
 
     if "describe your issue" in page_lower:
-        _capture_screenshot(driver, account["email"])
+        await _capture_pw_screenshot(page, account["email"])
         raise RuntimeError("Form did not confirm submission")
 
     return True, "Submitted via Support Form"
 
 
-async def send_via_gethelp_form(account, body_text, challenge_callback=None):
+async def login_account_browser(account, challenge_callback=None):
+    from playwright.async_api import async_playwright
+
     account = await ensure_account_session_identity(account)
-    driver = None
-    try:
-        driver = _build_chrome_driver(account)
-        ok, msg = await _interactive_google_login(driver, account, challenge_callback)
-        if not ok:
-            return False, msg
-
-        first_name, last_name = extract_and_save_profile_names(driver, account)
-
-        try:
-            return await _run_gethelp_form_once(driver, account, body_text, first_name, last_name)
-        except Exception as nav_err:
-            if _is_tab_crash_error(nav_err):
-                logging.warning(f"Tab crash detected, retrying once: {_format_exc(nav_err)}")
-                try:
-                    driver.quit()
-                except Exception:
-                    pass
-                driver = _build_chrome_driver(account)
-                ok_r, msg_r = await _interactive_google_login(driver, account, challenge_callback)
-                if not ok_r:
-                    return False, msg_r
-                first_name, last_name = extract_and_save_profile_names(driver, account)
-                return await _run_gethelp_form_once(driver, account, body_text, first_name, last_name)
-            raise
-    except Exception as e:
-        err = _format_exc(e)
-        logging.error(f"GetHelp form error: {err}")
-        return False, err
-    finally:
-        if driver:
+    async with _BROWSER_LOCK:
+        _cleanup_stray_browser_processes()
+        async with async_playwright() as pw:
+            context = None
             try:
-                driver.quit()
-            except Exception:
-                pass
+                context, page = await _launch_playwright_context(pw, account)
+                ok, msg = await _interactive_google_login_pw(context, page, account, challenge_callback)
+                return ok, msg
+            except Exception as e:
+                err = _format_exc(e)
+                logging.error(f"Login error: {err}")
+                return False, err
+            finally:
+                if context:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+
+
+async def send_via_gethelp_form(account, body_text, challenge_callback=None):
+    from playwright.async_api import async_playwright
+
+    account = await ensure_account_session_identity(account)
+    async with _BROWSER_LOCK:
+        _cleanup_stray_browser_processes()
+        async with async_playwright() as pw:
+            for attempt in range(2):
+                context = None
+                try:
+                    context, page = await _launch_playwright_context(pw, account)
+                    ok, msg = await _interactive_google_login_pw(context, page, account, challenge_callback)
+                    if not ok:
+                        return False, msg
+
+                    first_name, last_name = await _extract_profile_names_pw(page, account)
+                    return await _run_gethelp_form_pw(page, account, body_text, first_name, last_name)
+                except Exception as e:
+                    err = _format_exc(e)
+                    if attempt == 0 and _is_browser_crash_error(err):
+                        logging.warning(f"Browser crash on GetHelp, retrying once: {err}")
+                        continue
+                    logging.error(f"GetHelp form error: {err}")
+                    return False, err
+                finally:
+                    if context:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+    return False, "GetHelp form failed"
 
 
 async def send_via_gmail_web(account, to_email, subject, body, challenge_callback=None):
-    from selenium.webdriver.common.by import By
-    from selenium.webdriver.support import expected_conditions as EC
-    from selenium.webdriver.support.ui import WebDriverWait
+    from playwright.async_api import async_playwright
 
     account = await ensure_account_session_identity(account)
-    driver = None
-    try:
-        driver = _build_chrome_driver(account)
-        ok, msg = await _interactive_google_login(driver, account, challenge_callback)
-        if not ok:
-            return False, msg
-
-        driver.get("https://mail.google.com/mail/u/0/?hl=en")
-        _close_extra_tabs(driver)
-
-        compose = WebDriverWait(driver, 25).until(
-            EC.element_to_be_clickable((By.XPATH, "//div[text()='Compose']"))
-        )
-        compose.click()
-        await asyncio.sleep(1.0)
-
-        driver.find_element(By.CSS_SELECTOR, "input[aria-label*='To'], input[peoplekit-id]").send_keys(to_email)
-        driver.find_element(By.NAME, "subjectbox").send_keys(subject)
-        driver.find_element(By.CSS_SELECTOR, "div[aria-label='Message Body']").send_keys(body)
-        driver.find_element(By.XPATH, "//div[text()='Send']").click()
-        await asyncio.sleep(2.0)
-        return True, "Sent via Gmail Web"
-    except Exception as e:
-        err = _format_exc(e)
-        logging.error(f"Gmail web error: {err}")
-        return False, err
-    finally:
-        if driver:
+    async with _BROWSER_LOCK:
+        _cleanup_stray_browser_processes()
+        async with async_playwright() as pw:
+            context = None
             try:
-                driver.quit()
-            except Exception:
-                pass
+                context, page = await _launch_playwright_context(pw, account)
+                ok, msg = await _interactive_google_login_pw(context, page, account, challenge_callback)
+                if not ok:
+                    return False, msg
+
+                await page.goto("https://mail.google.com/mail/u/0/?hl=en", wait_until="domcontentloaded")
+                compose = page.locator("div:text-is('Compose')").first
+                await compose.wait_for(state="visible", timeout=25000)
+                await compose.click()
+                await asyncio.sleep(1.0)
+
+                await page.locator("input[aria-label*='To'], input[peoplekit-id]").first.fill(to_email)
+                await page.locator("input[name='subjectbox']").first.fill(subject)
+                await page.locator("div[aria-label='Message Body']").first.fill(body)
+                await page.locator("div:text-is('Send')").first.click()
+                await asyncio.sleep(2.0)
+                return True, "Sent via Gmail Web"
+            except Exception as e:
+                err = _format_exc(e)
+                logging.error(f"Gmail web error: {err}")
+                return False, err
+            finally:
+                if context:
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
 
 
 async def dispatch_report(account, subject, body, method="auto", challenge_callback=None):

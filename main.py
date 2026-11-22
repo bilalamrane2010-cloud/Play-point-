@@ -600,28 +600,17 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def execute_login_only(bot, chat_id, account):
-    account = await core.ensure_account_session_identity(account)
-
     async def cb(email, ctype, shot, prompt_txt):
         return await send_challenge_to_telegram(bot, chat_id, email, ctype, shot, prompt_txt)
 
-    driver = None
     try:
-        driver = core._build_chrome_driver(account)
-        ok, msg = await core._interactive_google_login(driver, account, cb)
+        ok, msg = await core.login_account_browser(account, cb)
         if ok:
-            core.extract_and_save_profile_names(driver, account)
             await bot.send_message(chat_id, f"✅ تم تسجيل الدخول بنجاح: {account['email']}")
         else:
             await bot.send_message(chat_id, f"❌ تعذر تسجيل الدخول ({account['email']}): {msg}")
     except Exception as e:
         await bot.send_message(chat_id, f"❌ حدث خطأ: {core._format_exc(e)}")
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except Exception:
-                pass
 
 
 async def execute_report_task(bot, chat_id, account, force_method=None):
