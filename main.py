@@ -26,9 +26,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# The token should be supplied through the environment.  The legacy fallback is
-# kept only so existing deployments do not break; rotate it if it was exposed.
-DEFAULT_BOT_TOKEN = "9204455871:AAGTPgz2d086vZCYlFkrcDCci7DWr6un9oY"
+# The token MUST be supplied through the environment (TELEGRAM_BOT_TOKEN).
+# Never hard-code it: this repository is public and the token would be exposed.
+DEFAULT_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 
 USER_STATES: dict[int, dict] = {}
 ACTIVE_CHALLENGES: dict[str, dict] = {}
@@ -1037,8 +1037,11 @@ def main():
         or os.getenv("TOKEN")
         or DEFAULT_BOT_TOKEN
     ).strip()
-    if not os.getenv("TELEGRAM_BOT_TOKEN") and not os.getenv("BOT_TOKEN") and not os.getenv("TOKEN"):
-        logging.warning("Using the legacy hard-coded bot token. Set TELEGRAM_BOT_TOKEN and rotate the old token.")
+    if not token:
+        raise SystemExit(
+            "TELEGRAM_BOT_TOKEN is not set. Add it in Railway → Variables "
+            "(or your local .env) before starting the bot."
+        )
     if not ALLOWED_USER_IDS:
         logging.warning("ALLOWED_USER_IDS is not set: anyone who finds the bot can control it.")
 

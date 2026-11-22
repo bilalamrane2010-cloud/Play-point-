@@ -17,6 +17,8 @@
 
 ```bash
 pip install -r requirements.txt
+cp .env.example .env      # ثم عدّل القيم داخله
+export $(grep -v '^#' .env | xargs)
 python main.py
 ```
 
@@ -24,15 +26,18 @@ python main.py
 
 ```bash
 docker build -t play-point .
-docker run -d -v $(pwd)/bot_data:/app/bot_data play-point
+docker run -d --env-file .env -v $(pwd)/bot_data:/app/bot_data play-point
 ```
 
-## متغيرات البيئة (كلها اختيارية)
+> ⚠️ **لا يوجد أي توكن أو مفتاح داخل الكود.** يجب توفير `TELEGRAM_BOT_TOKEN`
+> و`OPENAI_API_KEY` عبر متغيرات البيئة، وإلا لن يبدأ البوت.
+
+## متغيرات البيئة (مطلوبة)
 
 | المتغير | الافتراضي | الوصف |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | مضبوط داخل `main.py` | توكن البوت |
-| `OPENAI_API_KEY` | مضبوط داخل `core.py` | مفتاح Groq/OpenAI |
+| `TELEGRAM_BOT_TOKEN` | **مطلوب** | توكن البوت من @BotFather (لا يوجد أي توكن داخل الكود) |
+| `OPENAI_API_KEY` | **مطلوب** | مفتاح Groq/OpenAI (لا يوجد أي مفتاح داخل الكود) |
 | `OPENAI_MODEL` | `openai/gpt-oss-120b` | اسم الموديل |
 | `ALLOWED_USER_IDS` | فارغ (الجميع) | آيديهات تيليجرام المسموح لها |
 | `BOT_DATA_DIR` | `bot_data` | مجلد تخزين البيانات |

@@ -31,10 +31,11 @@ from openai import AsyncOpenAI
 GOOGLE_PLAY_SUPPORT = "googleplay-support@google.com"
 
 # ---------------------------------------------------------------------------
-# Default AI credentials (Groq). Override with OPENAI_API_KEY / OPENAI_BASE_URL.
-# NOTE: keep this repository PRIVATE — a public repo exposes this key.
+# AI credentials (Groq). Supply via OPENAI_API_KEY (or DEFAULT_AI_API_KEY).
+# Never hard-code them: this repository is public.
 # ---------------------------------------------------------------------------
-DEFAULT_AI_API_KEY = os.getenv("DEFAULT_AI_API_KEY", "").strip() or "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"
+DEFAULT_AI_API_KEY = (os.getenv("DEFAULT_AI_API_KEY", "").strip()
+                      or os.getenv("OPENAI_API_KEY", "").strip())
 GETHELP_URL = "https://support.google.com/googleplay/gethelp"
 
 #: Hard lower bound between two consecutive submissions (6 hours).
