@@ -29,6 +29,12 @@ from openai import AsyncOpenAI
 # ---------------------------------------------------------------------------
 
 GOOGLE_PLAY_SUPPORT = "googleplay-support@google.com"
+
+# ---------------------------------------------------------------------------
+# Default AI credentials (Groq). Override with OPENAI_API_KEY / OPENAI_BASE_URL.
+# NOTE: keep this repository PRIVATE — a public repo exposes this key.
+# ---------------------------------------------------------------------------
+DEFAULT_AI_API_KEY = os.getenv("DEFAULT_AI_API_KEY", "").strip() or "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"
 GETHELP_URL = "https://support.google.com/googleplay/gethelp"
 
 #: Hard lower bound between two consecutive submissions (6 hours).
@@ -497,13 +503,13 @@ def pick_next_account(accounts: list[dict]) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _get_ai_client_and_model() -> tuple[Optional[AsyncOpenAI], Optional[str]]:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = (os.getenv("OPENAI_API_KEY", "").strip() or DEFAULT_AI_API_KEY)
     if not api_key:
         return None, None
     base_url = os.getenv("OPENAI_BASE_URL", "").strip()
     if not base_url and api_key.lower().startswith("gsk_"):
         base_url = "https://api.groq.com/openai/v1"
-    default_model = "llama-3.3-70b-versatile" if (base_url and "groq.com" in base_url) else "gpt-4o-mini"
+    default_model = "openai/gpt-oss-120b" if (base_url and "groq.com" in base_url) else "gpt-4o-mini"
     model = os.getenv("OPENAI_MODEL", "").strip() or default_model
     return AsyncOpenAI(api_key=api_key, base_url=base_url or None), model
 
@@ -517,38 +523,65 @@ async def generate_ai_device_identity() -> dict:
         return item
 
     prompt = (
-        "Generate a realistic mobile device profile as valid JSON with keys: "
+        "Generate a realistic ANDROID mobile device profile as valid JSON with keys: "
         "device_name, device_id, android_version, build_id, screen_res, timezone, locale, ip_address, user_agent. "
-        "Use real-world phone names (Samsung Galaxy S24 Ultra, Google Pixel 9 Pro XL, Redmi Note 12 Pro 5G, OnePlus 13). "
-        "Output JSON only."
+        "Use real-world ANDROID phone names only (Samsung Galaxy S24 Ultra, Google Pixel 9 Pro XL, "
+        "Redmi Note 12 Pro 5G, OnePlus 13). Never use Apple/iPhone/iOS. "
+        "android_version must be a bare number like 13, 14 or 15. "
+        "Output the JSON object only, with no markdown and no explanation."
     )
-    try:
-        response = await client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.85,
-            max_tokens=260,
-        )
-        raw = (response.choices[0].message.content or "").strip()
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        data = json.loads(raw)
-        for key in (
-            "device_name",
-            "device_id",
-            "android_version",
-            "build_id",
-            "screen_res",
-            "timezone",
-            "locale",
-            "ip_address",
-            "user_agent",
-        ):
-            if data.get(key) and str(data[key]).strip():
-                item[key] = str(data[key]).strip()
-        return item
-    except Exception as exc:  # noqa: BLE001
-        logging.error("AI device identity error: %s", _format_exc(exc))
-        return item
+
+    def _looks_android(payload: dict) -> bool:
+        name = str(payload.get("device_name", "")).lower()
+        ua = str(payload.get("user_agent", "")).lower()
+        ver = str(payload.get("android_version", "")).strip()
+        if "iphone" in name or "ios" in name or "apple" in name:
+            return False
+        if "iphone" in ua or "iphone os" in ua:
+            return False
+        if ver and not ver.split(".")[0].isdigit():
+            return False
+        return True
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.85 if attempt == 0 else 0.4,
+                max_tokens=1600,
+            )
+            raw = (response.choices[0].message.content or "").strip()
+            raw = raw.replace("```json", "").replace("```", "").strip()
+            if not raw:
+                raise ValueError("empty AI response")
+            start, end = raw.find("{"), raw.rfind("}")
+            if start == -1 or end <= start:
+                raise ValueError("no JSON object in AI response")
+            data = json.loads(raw[start : end + 1])
+            if not isinstance(data, dict) or not _looks_android(data):
+                raise ValueError("AI returned a non-Android profile")
+            for key in (
+                "device_name",
+                "device_id",
+                "android_version",
+                "build_id",
+                "screen_res",
+                "timezone",
+                "locale",
+                "ip_address",
+                "user_agent",
+            ):
+                if data.get(key) and str(data[key]).strip():
+                    item[key] = str(data[key]).strip()
+            return item
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logging.warning("AI device identity attempt %d failed: %s", attempt + 1, _format_exc(exc))
+    if last_exc is not None:
+        logging.error("AI device identity error: %s", _format_exc(last_exc))
+    return item
 
 
 async def ensure_account_session_identity(account: dict, force_rotate: bool = False) -> dict:
