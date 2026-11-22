@@ -20,6 +20,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
+DEFAULT_BOT_TOKEN = "9204455871:AAGTPgz2d086vZCYlFkrcDCci7DWr6un9oY"
+
 USER_STATES = {}
 ACTIVE_CHALLENGES = {}
 LAST_AUTO_RUN = {"ts": 0}
@@ -680,9 +682,12 @@ async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
-    if not token:
-        raise ValueError("TELEGRAM_BOT_TOKEN missing")
+    token = (
+        os.getenv("TELEGRAM_BOT_TOKEN")
+        or os.getenv("BOT_TOKEN")
+        or os.getenv("TOKEN")
+        or DEFAULT_BOT_TOKEN
+    ).strip()
 
     app = Application.builder().token(token).build()
     app.add_handler(CommandHandler("start", cmd_start))
