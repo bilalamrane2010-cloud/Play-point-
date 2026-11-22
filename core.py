@@ -1,25 +1,49 @@
-import os
-import json
-import time
-import random
-import shutil
+"""Core helpers for the Play Points support bot.
+
+This module owns persistence, report generation and the delivery channels
+(SMTP / Google support form / Gmail web).  It is intentionally free of any
+Telegram dependency so that every piece can be unit-tested in isolation.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
+import os
+import random
+import re
+import shutil
 import smtplib
-from email.mime.text import MIMEText
+import threading
+import time
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from email.utils import formataddr
+from typing import Any, Optional
+
 from openai import AsyncOpenAI
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 GOOGLE_PLAY_SUPPORT = "googleplay-support@google.com"
 GETHELP_URL = "https://support.google.com/googleplay/gethelp"
 
-DATA_DIR = "bot_data"
+#: Hard lower bound between two consecutive submissions (6 hours).
+MIN_SEND_INTERVAL_HOURS = 6
+MIN_SEND_INTERVAL_SECONDS = MIN_SEND_INTERVAL_HOURS * 3600
+
+DATA_DIR = os.getenv("BOT_DATA_DIR", "bot_data")
 ACCOUNTS_FILE = os.path.join(DATA_DIR, "accounts.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 STATS_FILE = os.path.join(DATA_DIR, "stats.json")
+SCHEDULER_FILE = os.path.join(DATA_DIR, "scheduler_state.json")
 PROFILES_DIR = os.path.join(DATA_DIR, "chrome_profiles")
 SCREENSHOTS_DIR = os.path.join(DATA_DIR, "screenshots")
+
+EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 
 BASE_REPORT_TEMPLATE = """Subject: Formal Appeal: Play Points Account Restriction Review
 Dear Google Play Support Team,
@@ -88,44 +112,65 @@ REAL_DEVICES_POOL = [
     },
 ]
 
+_FILE_LOCK = threading.RLock()
 
-def _format_exc(exc):
+
+# ---------------------------------------------------------------------------
+# Generic helpers
+# ---------------------------------------------------------------------------
+
+def _format_exc(exc: BaseException) -> str:
     raw = (str(exc) or "").strip()
     if "Stacktrace:" in raw:
         raw = raw.split("Stacktrace:", 1)[0].strip()
-    raw = raw.replace("Message:", "", 1).strip() if raw.startswith("Message:") else raw
+    if raw.startswith("Message:"):
+        raw = raw.replace("Message:", "", 1).strip()
     if not raw:
-        return f"{type(exc).__name__}"
-    return f"{type(exc).__name__}: {raw}" if not raw.startswith(type(exc).__name__) else raw
+        return type(exc).__name__
+    if raw.startswith(type(exc).__name__):
+        return raw
+    return f"{type(exc).__name__}: {raw}"
 
 
-def _get_ai_client_and_model():
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        return None, None
-    base_url = os.getenv("OPENAI_BASE_URL", "").strip()
-    if not base_url and api_key.lower().startswith("gsk_"):
-        base_url = "https://api.groq.com/openai/v1"
-    default_model = "llama-3.3-70b-versatile" if (base_url and "groq.com" in base_url) else "gpt-4o-mini"
-    model = os.getenv("OPENAI_MODEL", "").strip() or default_model
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url or None)
-    return client, model
+def is_valid_email(value: str) -> bool:
+    return bool(EMAIL_RE.match((value or "").strip()))
 
 
-def _ensure_storage():
+def _ensure_storage() -> None:
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(PROFILES_DIR, exist_ok=True)
     os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
 
-def _ensure_file(path, default):
+def _atomic_write_json(path: str, payload: Any) -> None:
+    _ensure_storage()
+    tmp = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=2)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+
+
+def _read_json(path: str, default: Any) -> Any:
     _ensure_storage()
     if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(default, f, ensure_ascii=False, indent=2)
+        _atomic_write_json(path, default)
+        return default
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (json.JSONDecodeError, OSError) as exc:
+        logging.error("Corrupted data file %s: %s", path, _format_exc(exc))
+        try:
+            os.replace(path, f"{path}.corrupt.{int(time.time())}")
+        except OSError:
+            pass
+        _atomic_write_json(path, default)
+        return default
 
 
-def infer_name_from_email(email):
+def infer_name_from_email(email: str) -> tuple[str, str]:
     local = email.split("@")[0].replace(".", " ").replace("_", " ").replace("-", " ").strip()
     parts = [p.capitalize() for p in local.split() if p.isalpha()]
     if len(parts) >= 2:
@@ -135,132 +180,158 @@ def infer_name_from_email(email):
     return (local.capitalize() or "Play"), "User"
 
 
-def load_accounts():
-    _ensure_file(ACCOUNTS_FILE, [])
-    with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+# ---------------------------------------------------------------------------
+# Accounts
+# ---------------------------------------------------------------------------
+
+def load_accounts() -> list[dict]:
+    with _FILE_LOCK:
+        data = _read_json(ACCOUNTS_FILE, [])
+        if not isinstance(data, list):
+            return []
+        return [a for a in data if isinstance(a, dict) and a.get("email")]
 
 
-def save_accounts(accounts):
-    _ensure_storage()
-    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(accounts, f, ensure_ascii=False, indent=2)
+def save_accounts(accounts: list[dict]) -> None:
+    with _FILE_LOCK:
+        _atomic_write_json(ACCOUNTS_FILE, accounts)
 
 
-def get_account(email):
-    for a in load_accounts():
-        if a["email"].lower() == email.lower():
-            return a
+def get_account(email: str) -> Optional[dict]:
+    target = (email or "").strip().lower()
+    for account in load_accounts():
+        if account["email"].lower() == target:
+            return account
     return None
 
 
 def add_account(
-    email,
-    first_name="",
-    last_name="",
-    app_password="",
-    password="",
-    auth_type="email_code",
-    device_name="",
-    device_id="",
-    ip_address="",
-    user_agent="",
-    timezone="",
-    locale="",
-    screen_res="",
-    android_version="",
-    build_id="",
-):
-    email_clean = email.strip()
-    accounts = load_accounts()
-    if any(a["email"].lower() == email_clean.lower() for a in accounts):
+    email: str,
+    first_name: str = "",
+    last_name: str = "",
+    app_password: str = "",
+    password: str = "",
+    auth_type: str = "email_code",
+    device_name: str = "",
+    device_id: str = "",
+    ip_address: str = "",
+    user_agent: str = "",
+    timezone: str = "",
+    locale: str = "",
+    screen_res: str = "",
+    android_version: str = "",
+    build_id: str = "",
+    cookies: Optional[list] = None,
+) -> bool:
+    email_clean = (email or "").strip()
+    if not is_valid_email(email_clean):
         return False
 
-    inf_first, inf_last = infer_name_from_email(email_clean)
-    fn = first_name.strip() or inf_first
-    ln = last_name.strip() or inf_last
+    with _FILE_LOCK:
+        accounts = load_accounts()
+        if any(a["email"].lower() == email_clean.lower() for a in accounts):
+            return False
 
-    base_dev = random.choice(REAL_DEVICES_POOL).copy()
-    prof_slug = email_clean.replace("@", "_at_").replace(".", "_")
-    accounts.append({
-        "email": email_clean,
-        "first_name": fn,
-        "last_name": ln,
-        "app_password": app_password.replace(" ", "").strip(),
-        "password": password.strip(),
-        "auth_type": auth_type,
-        "logged_in": False,
-        "profile_dir": os.path.join(PROFILES_DIR, prof_slug),
-        "device_name": device_name.strip() or base_dev["device_name"],
-        "device_id": device_id.strip() or f"DEV-{random.randint(100000, 999999)}",
-        "ip_address": ip_address.strip() or os.getenv("DEVICE_IP", "").strip() or base_dev["ip_address"],
-        "user_agent": user_agent.strip() or base_dev["user_agent"],
-        "timezone": timezone.strip() or base_dev["timezone"],
-        "locale": locale.strip() or base_dev["locale"],
-        "screen_res": screen_res.strip() or base_dev["screen_res"],
-        "android_version": android_version.strip() or base_dev["android_version"],
-        "build_id": build_id.strip() or base_dev["build_id"],
-        "identity_updated_at": time.time(),
-        "added_at": time.time(),
-        "sent": 0,
-        "last_status": "New",
-    })
-    save_accounts(accounts)
+        inf_first, inf_last = infer_name_from_email(email_clean)
+        base_dev = random.choice(REAL_DEVICES_POOL).copy()
+        prof_slug = email_clean.lower().replace("@", "_at_").replace(".", "_")
+        accounts.append(
+            {
+                "email": email_clean,
+                "first_name": (first_name or "").strip() or inf_first,
+                "last_name": (last_name or "").strip() or inf_last,
+                "app_password": (app_password or "").replace(" ", "").strip(),
+                "password": (password or "").strip(),
+                "auth_type": auth_type,
+                "logged_in": False,
+                "cookies": cookies or [],
+                "profile_dir": os.path.join(PROFILES_DIR, prof_slug),
+                "device_name": (device_name or "").strip() or base_dev["device_name"],
+                "device_id": (device_id or "").strip() or f"DEV-{random.randint(100000, 999999)}",
+                "ip_address": (ip_address or "").strip() or os.getenv("DEVICE_IP", "").strip() or base_dev["ip_address"],
+                "user_agent": (user_agent or "").strip() or base_dev["user_agent"],
+                "timezone": (timezone or "").strip() or base_dev["timezone"],
+                "locale": (locale or "").strip() or base_dev["locale"],
+                "screen_res": (screen_res or "").strip() or base_dev["screen_res"],
+                "android_version": (android_version or "").strip() or base_dev["android_version"],
+                "build_id": (build_id or "").strip() or base_dev["build_id"],
+                "identity_updated_at": time.time(),
+                "added_at": time.time(),
+                "last_sent_at": 0,
+                "sent": 0,
+                "last_status": "New",
+            }
+        )
+        save_accounts(accounts)
     return True
 
 
-def remove_account(email):
-    accounts = load_accounts()
-    new_list = [a for a in accounts if a["email"].lower() != email.lower()]
-    if len(new_list) == len(accounts):
-        return False
-    save_accounts(new_list)
+def remove_account(email: str) -> bool:
+    target = (email or "").strip().lower()
+    with _FILE_LOCK:
+        accounts = load_accounts()
+        new_list = [a for a in accounts if a["email"].lower() != target]
+        if len(new_list) == len(accounts):
+            return False
+        save_accounts(new_list)
     return True
 
 
-def update_account(email, **kwargs):
-    if "app_password" in kwargs and isinstance(kwargs["app_password"], str):
+def update_account(email: str, **kwargs) -> bool:
+    if isinstance(kwargs.get("app_password"), str):
         kwargs["app_password"] = kwargs["app_password"].replace(" ", "").strip()
-    accounts = load_accounts()
-    for a in accounts:
-        if a["email"].lower() == email.lower():
-            a.update(kwargs)
-            save_accounts(accounts)
-            return True
+    target = (email or "").strip().lower()
+    with _FILE_LOCK:
+        accounts = load_accounts()
+        for account in accounts:
+            if account["email"].lower() == target:
+                account.update(kwargs)
+                save_accounts(accounts)
+                return True
     return False
 
 
-def import_cookies_for_account(email, raw_json_str):
+def import_cookies_for_account(email: str, raw_json_str: str) -> tuple[bool, str]:
     try:
         parsed = json.loads(raw_json_str)
         if isinstance(parsed, dict) and "cookies" in parsed:
             parsed = parsed["cookies"]
         if not isinstance(parsed, list) or not parsed:
-            return False, "صيغة الكوكيز غير صالحة"
+            return False, "صيغة الكوكيز غير صالحة (يجب أن تكون قائمة JSON)"
         cleaned = []
-        for c in parsed:
-            if not isinstance(c, dict) or not c.get("name") or not c.get("value"):
+        for cookie in parsed:
+            if not isinstance(cookie, dict) or not cookie.get("name") or cookie.get("value") is None:
                 continue
-            cleaned.append({
-                "name": str(c["name"]),
-                "value": str(c["value"]),
-                "domain": str(c.get("domain") or ".google.com"),
-                "path": str(c.get("path") or "/"),
-            })
+            item = {
+                "name": str(cookie["name"]),
+                "value": str(cookie["value"]),
+                "domain": str(cookie.get("domain") or ".google.com"),
+                "path": str(cookie.get("path") or "/"),
+            }
+            if isinstance(cookie.get("expiry"), (int, float)):
+                item["expiry"] = int(cookie["expiry"])
+            if isinstance(cookie.get("secure"), bool):
+                item["secure"] = cookie["secure"]
+            cleaned.append(item)
         if not cleaned:
-            return False, "لا توجد كوكيز صالحة"
+            return False, "لا توجد كوكيز صالحة في الملف"
         ok = update_account(email, cookies=cleaned, logged_in=True, last_status="Session active")
-        return (True, f"تم استيراد {len(cleaned)} كوكيز") if ok else (False, "الحساب غير موجود")
-    except Exception as e:
-        return False, f"خطأ في JSON: {_format_exc(e)}"
+        return (True, f"تم استيراد {len(cleaned)} كوكي بنجاح") if ok else (False, "الحساب غير موجود")
+    except Exception as exc:  # noqa: BLE001
+        return False, f"خطأ في JSON: {_format_exc(exc)}"
 
 
-def load_settings():
-    defaults = {
+# ---------------------------------------------------------------------------
+# Settings / stats / scheduler state
+# ---------------------------------------------------------------------------
+
+def default_settings() -> dict:
+    return {
         "auto_send_enabled": False,
-        "auto_send_interval": 60,
-        "between_accounts_delay": 30,
-        "send_method": "web_form",
+        "send_interval_hours": MIN_SEND_INTERVAL_HOURS,
+        "auto_send_interval": MIN_SEND_INTERVAL_HOURS * 60,  # minutes (compat)
+        "between_accounts_delay": MIN_SEND_INTERVAL_SECONDS,  # seconds (compat)
+        "send_method": "auto",
         "min_delay": 25,
         "max_delay": 90,
         "target_email": GOOGLE_PLAY_SUPPORT,
@@ -268,50 +339,176 @@ def load_settings():
         "rotate_hours": 1,
         "auto_login_on_add": True,
     }
-    _ensure_file(SETTINGS_FILE, defaults)
-    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    for k, v in defaults.items():
-        data.setdefault(k, v)
-    return data
 
 
-def save_settings(s):
-    _ensure_storage()
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(s, f, ensure_ascii=False, indent=2)
+def load_settings() -> dict:
+    with _FILE_LOCK:
+        data = _read_json(SETTINGS_FILE, default_settings())
+        if not isinstance(data, dict):
+            data = default_settings()
+        for key, value in default_settings().items():
+            data.setdefault(key, value)
+        # Enforce the anti-spam floor even for old settings files.
+        try:
+            hours = float(data.get("send_interval_hours", MIN_SEND_INTERVAL_HOURS))
+        except (TypeError, ValueError):
+            hours = MIN_SEND_INTERVAL_HOURS
+        if hours < MIN_SEND_INTERVAL_HOURS:
+            hours = MIN_SEND_INTERVAL_HOURS
+            data["send_interval_hours"] = hours
+        data["auto_send_interval"] = int(hours * 60)
+        data["between_accounts_delay"] = int(hours * 3600)
+        return data
 
 
-def load_stats():
-    _ensure_file(STATS_FILE, {"total_sent": 0, "failed": 0, "history": []})
-    with open(STATS_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+def save_settings(settings: dict) -> None:
+    with _FILE_LOCK:
+        _atomic_write_json(SETTINGS_FILE, settings)
 
 
-def save_stats(s):
-    _ensure_storage()
-    with open(STATS_FILE, "w", encoding="utf-8") as f:
-        json.dump(s, f, ensure_ascii=False, indent=2)
+def send_interval_seconds(settings: Optional[dict] = None) -> int:
+    settings = settings or load_settings()
+    try:
+        hours = float(settings.get("send_interval_hours", MIN_SEND_INTERVAL_HOURS))
+    except (TypeError, ValueError):
+        hours = MIN_SEND_INTERVAL_HOURS
+    return max(MIN_SEND_INTERVAL_SECONDS, int(hours * 3600))
 
 
-def record_stat(email, success, channel, subject):
-    s = load_stats()
-    if success:
-        s["total_sent"] = s.get("total_sent", 0) + 1
-    else:
-        s["failed"] = s.get("failed", 0) + 1
-    s.setdefault("history", []).append({
-        "email": email,
-        "success": success,
-        "channel": channel,
-        "subject": subject,
-        "time": time.time(),
-    })
-    s["history"] = s["history"][-250:]
-    save_stats(s)
+def load_stats() -> dict:
+    with _FILE_LOCK:
+        data = _read_json(STATS_FILE, {"total_sent": 0, "failed": 0, "history": []})
+        if not isinstance(data, dict):
+            data = {"total_sent": 0, "failed": 0, "history": []}
+        data.setdefault("total_sent", 0)
+        data.setdefault("failed", 0)
+        data.setdefault("history", [])
+        return data
 
 
-async def generate_ai_device_identity():
+def save_stats(stats: dict) -> None:
+    with _FILE_LOCK:
+        _atomic_write_json(STATS_FILE, stats)
+
+
+def record_stat(email: str, success: bool, channel: str, subject: str) -> None:
+    with _FILE_LOCK:
+        stats = load_stats()
+        if success:
+            stats["total_sent"] = int(stats.get("total_sent", 0)) + 1
+        else:
+            stats["failed"] = int(stats.get("failed", 0)) + 1
+        history = stats.setdefault("history", [])
+        history.append(
+            {
+                "email": email,
+                "success": bool(success),
+                "channel": channel,
+                "subject": subject,
+                "time": time.time(),
+            }
+        )
+        stats["history"] = history[-250:]
+        save_stats(stats)
+
+
+def load_scheduler_state() -> dict:
+    with _FILE_LOCK:
+        data = _read_json(
+            SCHEDULER_FILE,
+            {"last_send_ts": 0.0, "last_account": "", "queue": [], "rr_index": 0},
+        )
+        if not isinstance(data, dict):
+            data = {}
+        data.setdefault("last_send_ts", 0.0)
+        data.setdefault("last_account", "")
+        data.setdefault("queue", [])
+        data.setdefault("rr_index", 0)
+        if not isinstance(data["queue"], list):
+            data["queue"] = []
+        return data
+
+
+def save_scheduler_state(state: dict) -> None:
+    with _FILE_LOCK:
+        _atomic_write_json(SCHEDULER_FILE, state)
+
+
+def seconds_until_next_send(settings: Optional[dict] = None, now: Optional[float] = None) -> int:
+    state = load_scheduler_state()
+    now = time.time() if now is None else now
+    interval = send_interval_seconds(settings)
+    elapsed = now - float(state.get("last_send_ts") or 0)
+    return max(0, int(interval - elapsed))
+
+
+def mark_global_send(email: str, when: Optional[float] = None) -> None:
+    when = time.time() if when is None else when
+    with _FILE_LOCK:
+        state = load_scheduler_state()
+        state["last_send_ts"] = when
+        state["last_account"] = email
+        state["rr_index"] = int(state.get("rr_index", 0)) + 1
+        save_scheduler_state(state)
+    update_account(email, last_sent_at=when)
+
+
+def enqueue_accounts(emails: list[str]) -> int:
+    with _FILE_LOCK:
+        state = load_scheduler_state()
+        queue = [e for e in state.get("queue", []) if isinstance(e, str)]
+        for email in emails:
+            if email and email not in queue:
+                queue.append(email)
+        state["queue"] = queue
+        save_scheduler_state(state)
+        return len(queue)
+
+
+def clear_queue() -> None:
+    with _FILE_LOCK:
+        state = load_scheduler_state()
+        state["queue"] = []
+        save_scheduler_state(state)
+
+
+def pick_next_account(accounts: list[dict]) -> Optional[dict]:
+    """Return the next account to use, honouring the manual queue then round-robin."""
+    if not accounts:
+        return None
+    by_email = {a["email"].lower(): a for a in accounts}
+    with _FILE_LOCK:
+        state = load_scheduler_state()
+        queue = [e for e in state.get("queue", []) if isinstance(e, str)]
+        while queue:
+            candidate = queue.pop(0).lower()
+            state["queue"] = queue
+            save_scheduler_state(state)
+            if candidate in by_email:
+                return by_email[candidate]
+        index = int(state.get("rr_index", 0)) % len(accounts)
+        state["rr_index"] = (index + 1) % len(accounts)
+        save_scheduler_state(state)
+        return accounts[index]
+
+
+# ---------------------------------------------------------------------------
+# AI helpers
+# ---------------------------------------------------------------------------
+
+def _get_ai_client_and_model() -> tuple[Optional[AsyncOpenAI], Optional[str]]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None, None
+    base_url = os.getenv("OPENAI_BASE_URL", "").strip()
+    if not base_url and api_key.lower().startswith("gsk_"):
+        base_url = "https://api.groq.com/openai/v1"
+    default_model = "llama-3.3-70b-versatile" if (base_url and "groq.com" in base_url) else "gpt-4o-mini"
+    model = os.getenv("OPENAI_MODEL", "").strip() or default_model
+    return AsyncOpenAI(api_key=api_key, base_url=base_url or None), model
+
+
+async def generate_ai_device_identity() -> dict:
     client, model = _get_ai_client_and_model()
     item = random.choice(REAL_DEVICES_POOL).copy()
     item["device_id"] = f"DEV-{random.randint(100000, 999999)}"
@@ -326,25 +523,36 @@ async def generate_ai_device_identity():
         "Output JSON only."
     )
     try:
-        resp = await client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.85,
             max_tokens=260,
         )
-        raw = resp.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
+        raw = (response.choices[0].message.content or "").strip()
+        raw = raw.replace("```json", "").replace("```", "").strip()
         data = json.loads(raw)
-        for k in ("device_name", "device_id", "android_version", "build_id", "screen_res", "timezone", "locale", "ip_address", "user_agent"):
-            if data.get(k) and str(data[k]).strip():
-                item[k] = str(data[k]).strip()
+        for key in (
+            "device_name",
+            "device_id",
+            "android_version",
+            "build_id",
+            "screen_res",
+            "timezone",
+            "locale",
+            "ip_address",
+            "user_agent",
+        ):
+            if data.get(key) and str(data[key]).strip():
+                item[key] = str(data[key]).strip()
         return item
-    except Exception as e:
-        logging.error(f"AI device identity error: {e}")
+    except Exception as exc:  # noqa: BLE001
+        logging.error("AI device identity error: %s", _format_exc(exc))
         return item
 
 
-async def ensure_account_session_identity(account, force_rotate=False):
-    if account.get("logged_in"):
+async def ensure_account_session_identity(account: dict, force_rotate: bool = False) -> dict:
+    if account.get("logged_in") and not force_rotate:
         return account
 
     settings = load_settings()
@@ -356,9 +564,8 @@ async def ensure_account_session_identity(account, force_rotate=False):
         or not account.get("device_id")
         or not account.get("device_name")
         or not account.get("ip_address")
-        or (now - account.get("identity_updated_at", 0) >= rotate_sec)
+        or (now - float(account.get("identity_updated_at") or 0) >= rotate_sec)
     )
-
     if not needs_rotation:
         return account
 
@@ -380,16 +587,23 @@ async def ensure_account_session_identity(account, force_rotate=False):
     return account
 
 
-async def generate_report():
-    settings = load_settings()
-    template = settings.get("base_template", BASE_REPORT_TEMPLATE)
-    client, model = _get_ai_client_and_model()
+def _template_report(template: str) -> dict:
+    lines = (template or BASE_REPORT_TEMPLATE).splitlines()
+    subject = "Formal Appeal: Play Points Account Restriction Review"
+    body_start = 0
+    if lines and lines[0].lower().startswith("subject:"):
+        subject = lines[0].split(":", 1)[1].strip() or subject
+        body_start = 1
+    body = "\n".join(lines[body_start:]).strip() or (template or BASE_REPORT_TEMPLATE)
+    return {"subject": subject, "body": body}
 
+
+async def generate_report() -> dict:
+    settings = load_settings()
+    template = settings.get("base_template") or BASE_REPORT_TEMPLATE
+    client, model = _get_ai_client_and_model()
     if not client:
-        parts = template.split("\n", 1)
-        subject = parts[0].replace("Subject:", "").strip()
-        body = parts[1].strip() if len(parts) > 1 else template
-        return {"subject": subject, "body": body}
+        return _template_report(template)
 
     prompt = (
         "Rewrite the following Google Play support appeal email so every submission has unique wording, "
@@ -405,98 +619,129 @@ async def generate_report():
         "BODY:\n<rewritten body>"
     )
     try:
-        resp = await client.chat.completions.create(
+        response = await client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=1.0,
             max_tokens=750,
         )
-        text = resp.choices[0].message.content.strip()
+        text = (response.choices[0].message.content or "").strip()
+        if not text:
+            return _template_report(template)
         subject = "Formal Appeal: Play Points Account Restriction Review"
         body = text
         lines = text.splitlines()
-        for i, line in enumerate(lines):
-            if line.upper().startswith("SUBJECT:"):
-                subject = line.split(":", 1)[1].strip()
-            elif line.upper().startswith("BODY:"):
-                body = "\n".join(lines[i + 1:]).strip()
+        for index, line in enumerate(lines):
+            upper = line.upper()
+            if upper.startswith("SUBJECT:"):
+                subject = line.split(":", 1)[1].strip() or subject
+            elif upper.startswith("BODY:"):
+                body = "\n".join(lines[index + 1:]).strip()
                 break
-        return {"subject": subject, "body": body}
-    except Exception as e:
-        logging.error(f"AI report generation failed: {e}")
-        parts = template.split("\n", 1)
-        subject = parts[0].replace("Subject:", "").strip()
-        body = parts[1].strip() if len(parts) > 1 else template
-        return {"subject": subject, "body": body}
-
-def _build_smtp_message(sender_email, sender_name, to_email, subject, body):
-    msg = MIMEMultipart()
-    msg["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
-    msg["To"] = to_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-    return msg
+        return {"subject": subject, "body": body or _template_report(template)["body"]}
+    except Exception as exc:  # noqa: BLE001
+        logging.error("AI report generation failed: %s", _format_exc(exc))
+        return _template_report(template)
 
 
-def _smtp_login_and_send(sender_email, app_pw, to_email, msg):
-    last_err = None
-    # المحاولة الأولى: STARTTLS على المنفذ 587 كما في أداة App Password المعتمدة
-    try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=20) as server:
-            server.ehlo()
+# ---------------------------------------------------------------------------
+# SMTP
+# ---------------------------------------------------------------------------
+
+def _smtp_config() -> dict:
+    """SMTP endpoint configuration (overridable for local testing)."""
+    return {
+        "host": os.getenv("SMTP_HOST", "smtp.gmail.com").strip() or "smtp.gmail.com",
+        "port": int(os.getenv("SMTP_PORT", "587") or 587),
+        "security": os.getenv("SMTP_SECURITY", "starttls").strip().lower() or "starttls",
+        "timeout": int(os.getenv("SMTP_TIMEOUT", "20") or 20),
+    }
+
+
+def _build_smtp_message(sender_email: str, sender_name: str, to_email: str, subject: str, body: str) -> MIMEMultipart:
+    message = MIMEMultipart()
+    message["From"] = formataddr((sender_name, sender_email)) if sender_name else sender_email
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.attach(MIMEText(body, "plain", "utf-8"))
+    return message
+
+
+def _smtp_attempt(config: dict, sender_email: str, app_pw: str, to_email: str, message: MIMEMultipart) -> tuple[bool, str]:
+    security = config["security"]
+    if security == "ssl":
+        server = smtplib.SMTP_SSL(config["host"], config["port"], timeout=config["timeout"])
+    else:
+        server = smtplib.SMTP(config["host"], config["port"], timeout=config["timeout"])
+    with server:
+        server.ehlo()
+        if security == "starttls":
             server.starttls()
             server.ehlo()
-            server.login(sender_email, app_pw)
-            server.sendmail(sender_email, [to_email], msg.as_string())
-        return True, "Sent successfully via Gmail SMTP (587 STARTTLS)"
-    except Exception as e:
-        last_err = e
+        server.login(sender_email, app_pw)
+        server.sendmail(sender_email, [to_email], message.as_string())
+    return True, f"Sent successfully via SMTP {config['host']}:{config['port']} ({security})"
 
-    # المحاولة الثانية: SSL مباشر على المنفذ 465 في حال حجب المنفذ 587 في السحابة
+
+def _smtp_login_and_send(sender_email: str, app_pw: str, to_email: str, message: MIMEMultipart) -> tuple[bool, str]:
+    config = _smtp_config()
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=20) as server:
-            server.login(sender_email, app_pw)
-            server.sendmail(sender_email, [to_email], msg.as_string())
-        return True, "Sent successfully via Gmail SMTP (465 SSL)"
-    except Exception as e2:
-        return False, f"SMTP 587: {_format_exc(last_err)} | SMTP 465: {_format_exc(e2)}"
+        return _smtp_attempt(config, sender_email, app_pw, to_email, message)
+    except Exception as exc:  # noqa: BLE001
+        last_error = _format_exc(exc)
+
+    # Only fall back to Gmail's alternate port when we are actually talking to Gmail.
+    if config["host"].lower().endswith("gmail.com") and config["port"] != 465:
+        alt = dict(config, port=465, security="ssl")
+        try:
+            return _smtp_attempt(alt, sender_email, app_pw, to_email, message)
+        except Exception as exc:  # noqa: BLE001
+            return False, f"SMTP {config['port']}: {last_error} | SMTP 465: {_format_exc(exc)}"
+    return False, f"SMTP {config['port']}: {last_error}"
 
 
-def send_via_smtp(account, to_email, subject, body):
+def send_via_smtp(account: dict, to_email: str, subject: str, body: str) -> tuple[bool, str]:
     app_pw = (account.get("app_password") or "").replace(" ", "").strip()
     if not app_pw:
         return False, "Missing App Password"
     sender_email = (account.get("email") or "").strip()
+    if not is_valid_email(sender_email):
+        return False, "Invalid sender email"
     sender_name = f"{account.get('first_name', '')} {account.get('last_name', '')}".strip() or "Google Play User"
-    msg = _build_smtp_message(sender_email, sender_name, to_email, subject, body)
-    ok, info = _smtp_login_and_send(sender_email, app_pw, to_email, msg)
+    message = _build_smtp_message(sender_email, sender_name, to_email, subject, body)
+    ok, info = _smtp_login_and_send(sender_email, app_pw, to_email, message)
     if not ok:
-        logging.error(f"SMTP error for {sender_email}: {info}")
+        logging.error("SMTP error for %s: %s", sender_email, info)
     return ok, info
 
 
-def test_smtp(account):
+def test_smtp(account: dict) -> tuple[bool, str]:
     app_pw = (account.get("app_password") or "").replace(" ", "").strip()
     if not app_pw:
         return False, "Missing App Password"
     sender_email = (account.get("email") or "").strip()
+    config = _smtp_config()
     try:
-        with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as server:
+        if config["security"] == "ssl":
+            server = smtplib.SMTP_SSL(config["host"], config["port"], timeout=config["timeout"])
+        else:
+            server = smtplib.SMTP(config["host"], config["port"], timeout=config["timeout"])
+        with server:
             server.ehlo()
-            server.starttls()
-            server.ehlo()
+            if config["security"] == "starttls":
+                server.starttls()
+                server.ehlo()
             server.login(sender_email, app_pw)
-        return True, "SMTP connection OK (587 STARTTLS)"
-    except Exception as e1:
-        try:
-            with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
-                server.login(sender_email, app_pw)
-            return True, "SMTP connection OK (465 SSL)"
-        except Exception as e2:
-            return False, f"587: {_format_exc(e1)} | 465: {_format_exc(e2)}"
+        return True, f"SMTP connection OK ({config['host']}:{config['port']} {config['security']})"
+    except Exception as exc:  # noqa: BLE001
+        return False, _format_exc(exc)
 
 
-def _resolve_chrome_binary():
+# ---------------------------------------------------------------------------
+# Chrome / Selenium
+# ---------------------------------------------------------------------------
+
+def _resolve_chrome_binary() -> Optional[str]:
     candidates = [
         os.getenv("CHROME_BIN", "").strip(),
         shutil.which("google-chrome"),
@@ -506,51 +751,55 @@ def _resolve_chrome_binary():
         "/usr/bin/chromium",
         "/usr/bin/chromium-browser",
     ]
-    for c in candidates:
-        if c and os.path.exists(c):
-            return c
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
     return None
 
 
-def _resolve_chromedriver_path():
-    env_drv = os.getenv("CHROMEDRIVER_PATH", "").strip()
-    if env_drv and os.path.exists(env_drv):
-        return env_drv
-    for name in ("chromedriver",):
-        p = shutil.which(name)
-        if p and os.path.exists(p):
-            return p
-    from webdriver_manager.chrome import ChromeDriverManager
-    return ChromeDriverManager().install()
-
-
-def _parse_resolution(res_str):
+def _resolve_chromedriver_path() -> Optional[str]:
+    env_driver = os.getenv("CHROMEDRIVER_PATH", "").strip()
+    if env_driver and os.path.exists(env_driver):
+        return env_driver
+    found = shutil.which("chromedriver")
+    if found and os.path.exists(found):
+        return found
     try:
-        w_str, h_str = str(res_str).lower().split("x", 1)
-        w, h = int(w_str.strip()), int(h_str.strip())
-        if 300 <= w <= 2560 and 500 <= h <= 4000:
-            return w, h
-    except Exception:
+        from webdriver_manager.chrome import ChromeDriverManager
+
+        return ChromeDriverManager().install()
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Could not resolve chromedriver: %s", _format_exc(exc))
+        return None
+
+
+def _parse_resolution(res_str: str) -> tuple[int, int]:
+    try:
+        width_str, height_str = str(res_str).lower().split("x", 1)
+        width, height = int(width_str.strip()), int(height_str.strip())
+        if 300 <= width <= 2560 and 500 <= height <= 4000:
+            return width, height
+    except Exception:  # noqa: BLE001
         pass
     return 412, 915
 
 
-def _clean_stale_profile_locks(prof_dir):
+def _clean_stale_profile_locks(prof_dir: str) -> None:
     for lock_name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
-        lp = os.path.join(prof_dir, lock_name)
+        lock_path = os.path.join(prof_dir, lock_name)
         try:
-            if os.path.lexists(lp):
-                os.remove(lp)
-        except Exception:
+            if os.path.lexists(lock_path):
+                os.remove(lock_path)
+        except OSError:
             pass
 
 
-def _build_chrome_driver(account):
+def _build_chrome_driver(account: dict):
     chrome_bin = _resolve_chrome_binary()
     if not chrome_bin:
         raise RuntimeError(
             "Google Chrome / Chromium not found in container. "
-            "Add Dockerfile or nixpacks.toml with chromium + chromedriver and Redeploy."
+            "Install chromium + chromium-driver (see Dockerfile) and redeploy."
         )
 
     prof_dir = account.get("profile_dir") or os.path.join(
@@ -563,38 +812,42 @@ def _build_chrome_driver(account):
     if width > 600:
         width, height = 412, 915
 
-    ua = account.get("user_agent") or (
+    user_agent = account.get("user_agent") or (
         "Mozilla/5.0 (Linux; Android 14; SM-S928B) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/131.0.6778.135 Mobile Safari/537.36"
     )
     locale = account.get("locale") or "en-US"
-    tz = account.get("timezone") or "Africa/Algiers"
-    dev_name = account.get("device_name") or "Samsung Galaxy S24 Ultra"
-    dev_id = account.get("device_id") or "DEV-000000"
-    ip_addr = account.get("ip_address") or "105.104.22.14"
+    timezone = account.get("timezone") or "Africa/Algiers"
+    device_name = account.get("device_name") or "Samsung Galaxy S24 Ultra"
+    device_id = account.get("device_id") or "DEV-000000"
+    ip_address = account.get("ip_address") or "105.104.22.14"
 
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
 
-    opts = webdriver.ChromeOptions()
-    opts.binary_location = chrome_bin
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-software-rasterizer")
-    opts.add_argument("--remote-debugging-pipe")
-    opts.add_argument("--headless=new")
-    opts.add_argument(f"--window-size={width},{height}")
-    opts.add_argument(f"--lang={locale}")
-    opts.add_argument(f"--user-agent={ua}")
-    opts.add_argument(f"--user-data-dir={prof_dir}")
-    opts.add_argument("--profile-directory=Default")
+    options = webdriver.ChromeOptions()
+    options.binary_location = chrome_bin
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--no-first-run")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    if os.getenv("HEADLESS", "1").strip().lower() not in ("0", "false", "no"):
+        options.add_argument("--headless=new")
+    options.add_argument(f"--window-size={width},{height}")
+    options.add_argument(f"--lang={locale}")
+    options.add_argument(f"--user-agent={user_agent}")
+    options.add_argument(f"--user-data-dir={prof_dir}")
+    options.add_argument("--profile-directory=Default")
 
     driver_path = _resolve_chromedriver_path()
-    driver = webdriver.Chrome(service=Service(driver_path), options=opts)
+    service = Service(driver_path) if driver_path else Service()
+    driver = webdriver.Chrome(service=service, options=options)
 
     try:
         driver.execute_cdp_cmd(
@@ -604,14 +857,14 @@ def _build_chrome_driver(account):
                     Object.defineProperty(navigator, 'webdriver', {{get: () => undefined}});
                     Object.defineProperty(navigator, 'platform', {{get: () => 'Linux armv8l'}});
                     window.__DEVICE_IDENTITY__ = {{
-                        deviceName: {json.dumps(dev_name)},
-                        deviceId: {json.dumps(dev_id)},
-                        ipAddress: {json.dumps(ip_addr)}
+                        deviceName: {json.dumps(device_name)},
+                        deviceId: {json.dumps(device_id)},
+                        ipAddress: {json.dumps(ip_address)}
                     }};
                 """
             },
         )
-        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": tz})
+        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
         driver.execute_cdp_cmd(
             "Emulation.setDeviceMetricsOverride",
             {
@@ -621,53 +874,93 @@ def _build_chrome_driver(account):
                 "mobile": True,
             },
         )
-    except Exception:
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logging.debug("CDP emulation setup failed: %s", _format_exc(exc))
 
     return driver
 
 
-def _capture_screenshot(driver, email):
-    _ensure_storage()
-    fname = f"{email.replace('@', '_')}_{int(time.time())}.png"
-    path = os.path.join(SCREENSHOTS_DIR, fname)
-    driver.save_screenshot(path)
-    return path
-
-
-def _is_insecure_browser_block(driver):
+def _apply_saved_cookies(driver, account: dict) -> int:
+    """Inject previously imported cookies into the fresh browser profile."""
+    cookies = account.get("cookies") or []
+    if not cookies:
+        return 0
     try:
-        txt = ((driver.title or "") + " " + (driver.page_source or "")).lower()
-        return (
-            "couldn't sign you in" in txt
-            or "this browser or app may not be secure" in txt
-            or "browser or app may not be secure" in txt
-        )
-    except Exception:
-        return False
+        driver.get("https://www.google.com/")
+        time.sleep(1)
+    except Exception:  # noqa: BLE001
+        pass
+    applied = 0
+    for cookie in cookies:
+        try:
+            payload = {
+                "name": cookie["name"],
+                "value": cookie["value"],
+                "domain": cookie.get("domain") or ".google.com",
+                "path": cookie.get("path") or "/",
+            }
+            if cookie.get("expiry"):
+                payload["expiry"] = int(cookie["expiry"])
+            if "secure" in cookie:
+                payload["secure"] = bool(cookie["secure"])
+            driver.add_cookie(payload)
+            applied += 1
+        except Exception:  # noqa: BLE001
+            continue
+    if applied:
+        logging.info("Applied %s saved cookies for %s", applied, account.get("email"))
+    return applied
 
 
-def _has_real_captcha_challenge(driver):
+def _capture_screenshot(driver, email: str) -> Optional[str]:
+    try:
+        _ensure_storage()
+        safe = re.sub(r"[^A-Za-z0-9_.-]", "_", email)
+        path = os.path.join(SCREENSHOTS_DIR, f"{safe}_{int(time.time())}.png")
+        driver.save_screenshot(path)
+        return path
+    except Exception as exc:  # noqa: BLE001
+        logging.warning("Screenshot failed: %s", _format_exc(exc))
+        return None
+
+
+def _page_text(driver) -> str:
+    try:
+        return ((driver.title or "") + " " + (driver.page_source or "")).lower()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _is_insecure_browser_block(driver) -> bool:
+    text = _page_text(driver)
+    return (
+        "couldn't sign you in" in text
+        or "this browser or app may not be secure" in text
+        or "browser or app may not be secure" in text
+    )
+
+
+def _has_real_captcha_challenge(driver) -> bool:
     try:
         from selenium.webdriver.common.by import By
 
         if _is_insecure_browser_block(driver):
             return False
-        cur = (driver.current_url or "").lower()
-        if "recaptcha" in cur or "captcha" in cur:
+        current = (driver.current_url or "").lower()
+        if "recaptcha" in current or "captcha" in current:
             return True
-        frames = driver.find_elements(By.CSS_SELECTOR, "iframe[src*='recaptcha'], iframe[title*='recaptcha'], iframe[src*='captcha']")
+        frames = driver.find_elements(
+            By.CSS_SELECTOR, "iframe[src*='recaptcha'], iframe[title*='recaptcha'], iframe[src*='captcha']"
+        )
         if frames:
             return True
-        imgs = driver.find_elements(By.CSS_SELECTOR, "img[src*='captcha'], img[alt*='captcha' i]")
-        if imgs:
-            return True
-        return False
-    except Exception:
+        images = driver.find_elements(By.CSS_SELECTOR, "img[src*='captcha'], img[alt*='captcha' i]")
+        return bool(images)
+    except Exception:  # noqa: BLE001
         return False
 
 
-def extract_and_save_profile_names(driver, account):
+def extract_and_save_profile_names(driver, account: dict) -> tuple[str, str]:
     first_name = (account.get("first_name") or "").strip()
     last_name = (account.get("last_name") or "").strip()
 
@@ -675,72 +968,78 @@ def extract_and_save_profile_names(driver, account):
         driver.get("https://myaccount.google.com/profile/name?hl=en")
         time.sleep(3)
         inputs = driver.find_elements("css selector", "input[type='text']")
-        vals = [i.get_attribute("value").strip() for i in inputs if i.get_attribute("value")]
-        if len(vals) >= 2:
-            first_name, last_name = vals[0], vals[1]
+        values = [i.get_attribute("value").strip() for i in inputs if i.get_attribute("value")]
+        if len(values) >= 2:
+            first_name, last_name = values[0], values[1]
             update_account(account["email"], first_name=first_name, last_name=last_name)
             return first_name, last_name
-        if len(vals) == 1 and " " in vals[0]:
-            p = vals[0].split(None, 1)
-            first_name, last_name = p[0], p[1]
+        if len(values) == 1 and " " in values[0]:
+            parts = values[0].split(None, 1)
+            first_name, last_name = parts[0], parts[1]
             update_account(account["email"], first_name=first_name, last_name=last_name)
             return first_name, last_name
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
     try:
         driver.get("https://myaccount.google.com/?hl=en")
         time.sleep(3)
         headings = driver.find_elements("css selector", "h1, [role='heading']")
-        for h in headings:
-            txt = (h.text or "").strip()
-            if txt and "@" not in txt and len(txt.split()) >= 2 and len(txt) < 60:
-                p = txt.split(None, 1)
-                first_name, last_name = p[0], p[1]
+        for heading in headings:
+            text = (heading.text or "").strip()
+            if text and "@" not in text and len(text.split()) >= 2 and len(text) < 60:
+                parts = text.split(None, 1)
+                first_name, last_name = parts[0], parts[1]
                 update_account(account["email"], first_name=first_name, last_name=last_name)
                 return first_name, last_name
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
     if not first_name or not last_name:
-        inf_f, inf_l = infer_name_from_email(account["email"])
-        first_name = first_name or inf_f
-        last_name = last_name or inf_l
+        inferred_first, inferred_last = infer_name_from_email(account["email"])
+        first_name = first_name or inferred_first
+        last_name = last_name or inferred_last
         update_account(account["email"], first_name=first_name, last_name=last_name)
 
     return first_name, last_name
 
 
-async def _interactive_google_login(driver, account, challenge_callback=None, timeout=180):
+async def _interactive_google_login(driver, account: dict, challenge_callback=None, timeout: int = 180) -> tuple[bool, str]:
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
-    from selenium.webdriver.support.ui import WebDriverWait
     from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
+
+    # Restore imported cookies before touching the login page.
+    if account.get("cookies"):
+        _apply_saved_cookies(driver, account)
 
     driver.get("https://myaccount.google.com/?hl=en")
     await asyncio.sleep(4)
 
-    if "myaccount.google.com" in driver.current_url and "signin" not in driver.current_url:
+    current = driver.current_url or ""
+    if "myaccount.google.com" in current and "signin" not in current and "ServiceLogin" not in current:
         extract_and_save_profile_names(driver, account)
         update_account(account["email"], logged_in=True, last_status="Session active")
         return True, "Logged in via saved session"
 
     if _is_insecure_browser_block(driver):
         update_account(account["email"], last_status="Blocked: Browser/IP not trusted by Google")
-        return False, "Google blocked sign-in ('This browser or app may not be secure'). Use a trusted session profile or residential IP/proxy."
+        return False, "Google blocked sign-in ('This browser or app may not be secure'). Use a trusted session profile or residential IP."
 
     driver.get("https://accounts.google.com/signin/v2/identifier?hl=en")
     try:
-        email_input = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.ID, "identifierId"))
-        )
+        email_input = WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.ID, "identifierId")))
         email_input.clear()
         email_input.send_keys(account["email"])
         email_input.send_keys(Keys.ENTER)
         await asyncio.sleep(3)
-    except Exception as e:
-        return False, f"Failed to enter email: {e}"
+    except Exception as exc:  # noqa: BLE001
+        return False, f"Failed to enter email: {_format_exc(exc)}"
 
+    page = _page_text(driver)
+    if "couldn't find your google account" in page or "enter a valid email" in page:
+        return False, "Google rejected the email address"
     if _is_insecure_browser_block(driver):
         update_account(account["email"], last_status="Blocked: Browser/IP not trusted by Google")
         return False, "Google blocked sign-in ('This browser or app may not be secure')."
@@ -756,19 +1055,19 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         if not code or code.lower() == "/cancel":
             return False, "Cancelled by user"
         try:
-            cap_box = driver.find_element(By.CSS_SELECTOR, "input[type='text']")
-            cap_box.send_keys(code)
-            cap_box.send_keys(Keys.ENTER)
+            captcha_box = driver.find_element(By.CSS_SELECTOR, "input[type='text']")
+            captcha_box.send_keys(code)
+            captcha_box.send_keys(Keys.ENTER)
             await asyncio.sleep(3)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
     try:
-        pwd_input = WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.NAME, "Passwd"))
+        password_input = WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='Passwd'], input[type='password']"))
         )
-        pwd_to_use = (account.get("password") or "").strip()
-        if not pwd_to_use and challenge_callback:
+        password = (account.get("password") or "").strip()
+        if not password and challenge_callback:
             shot = _capture_screenshot(driver, account["email"])
             reply = await challenge_callback(
                 account["email"],
@@ -777,48 +1076,50 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
                 "Enter the Google account password (or /cancel):",
             )
             if reply and reply.lower() != "/cancel" and reply.lower() not in ("done", "ok"):
-                pwd_to_use = reply.strip()
-        if not pwd_to_use:
+                password = reply.strip()
+        if not password:
             return False, "Account password not provided"
-        pwd_input.clear()
-        pwd_input.send_keys(pwd_to_use)
-        pwd_input.send_keys(Keys.ENTER)
+        password_input.clear()
+        password_input.send_keys(password)
+        password_input.send_keys(Keys.ENTER)
         await asyncio.sleep(4)
-    except Exception:
+    except Exception:  # noqa: BLE001
         pass
 
     notified_2fa = False
-    start = time.time()
-    while time.time() - start < timeout:
+    started = time.time()
+    while time.time() - started < timeout:
         if _is_insecure_browser_block(driver):
             update_account(account["email"], last_status="Blocked: Browser/IP not trusted by Google")
             return False, "Google blocked sign-in ('This browser or app may not be secure')."
 
-        cur = driver.current_url
-        if "myaccount.google.com" in cur or "mail.google.com" in cur or "support.google.com" in cur:
-            if "signin" not in cur and "challenge" not in cur:
+        current = driver.current_url or ""
+        if any(domain in current for domain in ("myaccount.google.com", "mail.google.com", "support.google.com")):
+            if "signin" not in current and "challenge" not in current:
                 extract_and_save_profile_names(driver, account)
                 update_account(account["email"], logged_in=True, last_status="Logged in and session saved")
                 return True, "Logged in successfully"
 
-        if "challenge" in cur and not notified_2fa and challenge_callback:
+        if "challenge" in current and not notified_2fa and challenge_callback:
             notified_2fa = True
             shot = _capture_screenshot(driver, account["email"])
-            user_reply = await challenge_callback(
+            reply = await challenge_callback(
                 account["email"],
                 "2fa",
                 shot,
                 "Verification code / 2FA required: send the code from your email/phone or approve and tap Done:",
             )
-            if user_reply and user_reply.lower() == "/cancel":
+            if reply and reply.lower() == "/cancel":
                 return False, "2FA cancelled"
-            if user_reply and user_reply.lower() not in ("done", "ok"):
+            if reply and reply.lower() not in ("done", "ok"):
                 try:
-                    code_input = driver.find_element(By.CSS_SELECTOR, "input[type='tel'], input[type='text'], input[type='number']")
+                    code_input = driver.find_element(
+                        By.CSS_SELECTOR, "input[type='tel'], input[type='text'], input[type='number']"
+                    )
                     code_input.clear()
-                    code_input.send_keys(user_reply.strip())
+                    code_input.send_keys(reply.strip())
                     code_input.send_keys(Keys.ENTER)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
 
         await asyncio.sleep(3)
@@ -826,73 +1127,74 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
     return False, "2FA or verification timeout"
 
 
-async def send_via_gethelp_form(account, body_text, challenge_callback=None):
+async def send_via_gethelp_form(account: dict, body_text: str, challenge_callback=None) -> tuple[bool, str]:
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support.ui import Select, WebDriverWait
 
-    def _safe_click(el):
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
-        time.sleep(0.2)
-        try:
-            el.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", el)
+    driver = None
 
-    def _safe_type(el, val):
-        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", el)
+    def _safe_click(element) -> None:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
         time.sleep(0.2)
         try:
-            el.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", el)
+            element.click()
+        except Exception:  # noqa: BLE001
+            driver.execute_script("arguments[0].click();", element)
+
+    def _safe_type(element, value: str) -> None:
+        driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", element)
+        time.sleep(0.2)
         try:
-            el.clear()
-        except Exception:
+            element.click()
+        except Exception:  # noqa: BLE001
+            driver.execute_script("arguments[0].click();", element)
+        try:
+            element.clear()
+        except Exception:  # noqa: BLE001
             pass
         try:
-            el.send_keys(val)
-        except Exception:
+            element.send_keys(value)
+        except Exception:  # noqa: BLE001
             driver.execute_script(
                 "arguments[0].value = arguments[1];"
                 "arguments[0].dispatchEvent(new Event('input', {bubbles: true}));"
                 "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
-                el,
-                val,
+                element,
+                value,
             )
 
-    def _visible(els):
-        out = []
-        for el in els:
+    def _visible(elements):
+        result = []
+        for element in elements:
             try:
-                if el.is_displayed() and el.is_enabled():
-                    out.append(el)
-            except Exception:
+                if element.is_displayed() and element.is_enabled():
+                    result.append(element)
+            except Exception:  # noqa: BLE001
                 pass
-        return out
+        return result
 
-    def _click_text_match(phrases):
-        for el in driver.find_elements(By.XPATH, "//button | //div[@role='button'] | //span | //label"):
+    def _click_text_match(phrases) -> bool:
+        for element in driver.find_elements(By.XPATH, "//button | //div[@role='button'] | //span | //label | //a"):
             try:
-                if not el.is_displayed():
+                if not element.is_displayed():
                     continue
-                t = (el.text or "").strip().lower()
-                if not t or len(t) > 90:
+                text = (element.text or "").strip().lower()
+                if not text or len(text) > 90:
                     continue
-                if any(p in t for p in phrases):
-                    _safe_click(el)
+                if any(phrase in text for phrase in phrases):
+                    _safe_click(element)
                     return True
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
         return False
 
     account = await ensure_account_session_identity(account)
-    driver = None
     try:
         driver = _build_chrome_driver(account)
-        ok, msg = await _interactive_google_login(driver, account, challenge_callback)
+        ok, message = await _interactive_google_login(driver, account, challenge_callback)
         if not ok:
-            return False, msg
+            return False, message
 
         first_name, last_name = extract_and_save_profile_names(driver, account)
 
@@ -907,33 +1209,33 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
                 _safe_type(step1_inputs[0], "Play point issues")
                 try:
                     step1_inputs[0].send_keys(Keys.ENTER)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
                 await asyncio.sleep(1.2)
                 _click_text_match(["next step", "next", "التالي"])
                 await asyncio.sleep(2.0)
-        except Exception:
+        except Exception:  # noqa: BLE001
             pass
 
         if not _click_text_match(["play points issue", "play points", "نقاط play"]):
             _click_text_match(["other", "غير ذلك"])
         await asyncio.sleep(1.0)
 
-        for sel_el in driver.find_elements(By.TAG_NAME, "select"):
+        for select_element in driver.find_elements(By.TAG_NAME, "select"):
             try:
-                if not sel_el.is_displayed() or not sel_el.is_enabled():
+                if not select_element.is_displayed() or not select_element.is_enabled():
                     continue
-                s = Select(sel_el)
+                selector = Select(select_element)
                 picked = False
-                for opt in s.options:
-                    ot = (opt.text or "").strip().lower()
-                    if "google play apps" in ot or "play pass" in ot:
-                        s.select_by_visible_text(opt.text)
+                for option in selector.options:
+                    option_text = (option.text or "").strip().lower()
+                    if "google play apps" in option_text or "play pass" in option_text:
+                        selector.select_by_visible_text(option.text)
                         picked = True
                         break
-                if not picked and len(s.options) > 1:
-                    s.select_by_index(1)
-            except Exception:
+                if not picked and len(selector.options) > 1:
+                    selector.select_by_index(1)
+            except Exception:  # noqa: BLE001
                 pass
         await asyncio.sleep(0.8)
 
@@ -953,33 +1255,35 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
             _click_text_match(["next step", "next", "التالي"])
             await asyncio.sleep(1.5)
 
-        for einp in _visible(driver.find_elements(By.CSS_SELECTOR, "input[type='email']")):
-            if not (einp.get_attribute("value") or "").strip():
-                _safe_type(einp, account["email"])
+        for email_input in _visible(driver.find_elements(By.CSS_SELECTOR, "input[type='email']")):
+            if not (email_input.get_attribute("value") or "").strip():
+                _safe_type(email_input, account["email"])
 
-        vis_txt_inputs = _visible(driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type])"))
-        for idx, inp in enumerate(vis_txt_inputs):
-            cur_val = (inp.get_attribute("value") or "").strip()
-            lbl = ((inp.get_attribute("aria-label") or "") + " " + (inp.get_attribute("placeholder") or "")).lower()
+        visible_inputs = _visible(driver.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type])"))
+        for index, element in enumerate(visible_inputs):
+            current_value = (element.get_attribute("value") or "").strip()
+            label = ((element.get_attribute("aria-label") or "") + " " + (element.get_attribute("placeholder") or "")).lower()
             try:
-                lbl += " " + (inp.find_element(By.XPATH, "./ancestor::*[self::div or self::section][1]").text or "").lower()
-            except Exception:
+                label += " " + (
+                    element.find_element(By.XPATH, "./ancestor::*[self::div or self::section][1]").text or ""
+                ).lower()
+            except Exception:  # noqa: BLE001
                 pass
-            if "transaction id" in lbl or "order id" in lbl or "gpa." in lbl:
-                _safe_type(inp, "N/A")
-            elif idx == 0 and not cur_val:
-                _safe_type(inp, first_name)
-            elif idx == 1 and not cur_val:
-                _safe_type(inp, last_name)
-            elif not cur_val:
-                _safe_type(inp, "N/A")
+            if "transaction id" in label or "order id" in label or "gpa." in label:
+                _safe_type(element, "N/A")
+            elif index == 0 and not current_value:
+                _safe_type(element, first_name)
+            elif index == 1 and not current_value:
+                _safe_type(element, last_name)
+            elif not current_value:
+                _safe_type(element, "N/A")
 
-        vis_areas = _visible(driver.find_elements(By.CSS_SELECTOR, "textarea"))
-        if not vis_areas:
+        visible_areas = _visible(driver.find_elements(By.CSS_SELECTOR, "textarea"))
+        if not visible_areas:
             _capture_screenshot(driver, account["email"])
             return False, "Support form fields did not load"
 
-        _safe_type(vis_areas[0], body_text)
+        _safe_type(visible_areas[0], body_text)
         await asyncio.sleep(0.8)
 
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
@@ -987,14 +1291,14 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
 
         submitted = _click_text_match(["submit", "send", "إرسال"])
         if not submitted:
-            for css_s in (
+            for css in (
                 "button[type='submit']",
                 "input[type='submit']",
                 "[aria-label*='submit' i]",
                 "[aria-label*='send' i]",
                 "[aria-label*='إرسال' i]",
             ):
-                found = _visible(driver.find_elements(By.CSS_SELECTOR, css_s))
+                found = _visible(driver.find_elements(By.CSS_SELECTOR, css))
                 if found:
                     _safe_click(found[0])
                     submitted = True
@@ -1005,89 +1309,127 @@ async def send_via_gethelp_form(account, body_text, challenge_callback=None):
             return False, "Submit button not found on support form"
 
         await asyncio.sleep(3.5)
-        src_low = (driver.page_source or "").lower()
-        if "we couldn't submit your form yet" in src_low or "please fix the fields above" in src_low:
+        source = (driver.page_source or "").lower()
+        if "we couldn't submit your form yet" in source or "please fix the fields above" in source:
             _capture_screenshot(driver, account["email"])
             return False, "Form validation error on submit"
 
         return True, "Submitted via Google Play GetHelp"
-    except Exception as e:
-        logging.error(f"GetHelp form error: {e}")
-        return False, f"GetHelp form error: {_format_exc(e)}"
+    except Exception as exc:  # noqa: BLE001
+        logging.error("GetHelp form error: %s", _format_exc(exc))
+        return False, f"GetHelp form error: {_format_exc(exc)}"
     finally:
         if driver:
             try:
                 driver.quit()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
 
 
-async def send_via_gmail_web(account, to_email, subject, body, challenge_callback=None):
+async def send_via_gmail_web(account: dict, to_email: str, subject: str, body: str, challenge_callback=None) -> tuple[bool, str]:
     from selenium.webdriver.common.by import By
-    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support import expected_conditions as EC
+    from selenium.webdriver.support.ui import WebDriverWait
 
     account = await ensure_account_session_identity(account)
     driver = None
     try:
         driver = _build_chrome_driver(account)
-        ok, msg = await _interactive_google_login(driver, account, challenge_callback)
+        ok, message = await _interactive_google_login(driver, account, challenge_callback)
         if not ok:
-            return False, msg
+            return False, message
 
         driver.get("https://mail.google.com/mail/u/0/?hl=en")
         await asyncio.sleep(5)
 
         compose = WebDriverWait(driver, 25).until(
-            EC.element_to_be_clickable((By.XPATH, "//div[text()='Compose']"))
+            EC.element_to_be_clickable((By.XPATH, "//div[text()='Compose'] | //div[@role='button' and @gh='cm']"))
         )
         compose.click()
         await asyncio.sleep(2)
 
-        driver.find_element(By.CSS_SELECTOR, "input[aria-label*='To'], input[peoplekit-id]").send_keys(to_email)
-        driver.find_element(By.NAME, "subjectbox").send_keys(subject)
-        driver.find_element(By.CSS_SELECTOR, "div[aria-label='Message Body']").send_keys(body)
-        driver.find_element(By.XPATH, "//div[text()='Send']").click()
+        to_box = WebDriverWait(driver, 15).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "input[aria-label*='To'], input[peoplekit-id], textarea[aria-label*='To']")
+            )
+        )
+        to_box.send_keys(to_email)
+        to_box.send_keys(Keys.ENTER)
+        await asyncio.sleep(1)
+
+        subject_box = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "input[name='subjectbox'], input[aria-label*='Subject']"))
+        )
+        subject_box.send_keys(subject)
+
+        body_box = WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located(
+                (By.CSS_SELECTOR, "div[aria-label='Message Body'], div[aria-label*='Message body']")
+            )
+        )
+        body_box.send_keys(body)
+        await asyncio.sleep(1)
+
+        send_button = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//div[text()='Send'] | //div[@role='button' and @aria-label*='Send']"))
+        )
+        send_button.click()
         await asyncio.sleep(4)
         return True, "Sent via Gmail Web"
-    except Exception as e:
-        logging.error(f"Gmail web error: {e}")
-        return False, str(e)
+    except Exception as exc:  # noqa: BLE001
+        logging.error("Gmail web error: %s", _format_exc(exc))
+        return False, _format_exc(exc)
     finally:
         if driver:
             try:
                 driver.quit()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 pass
 
 
-async def dispatch_report(account, subject, body, method="auto", challenge_callback=None):
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+
+async def dispatch_report(
+    account: dict,
+    subject: str,
+    body: str,
+    method: str = "auto",
+    challenge_callback=None,
+) -> tuple[bool, str, str]:
     settings = load_settings()
     target_email = settings.get("target_email", GOOGLE_PLAY_SUPPORT)
     has_smtp = bool((account.get("app_password") or "").replace(" ", "").strip())
 
-    def _smtp_fallback(reason):
+    async def _smtp_fallback(reason: str) -> tuple[bool, str, str]:
         if has_smtp:
-            s_ok, s_info = send_via_smtp(account, target_email, subject, body)
-            if s_ok:
-                return True, s_info, "smtp"
-            return False, f"{reason} | {s_info}", method
+            ok, info = await asyncio.to_thread(send_via_smtp, account, target_email, subject, body)
+            if ok:
+                return True, info, "smtp"
+            return False, f"{reason} | {info}", method
         return False, reason, method
 
     if method == "web_form":
         ok, info = await send_via_gethelp_form(account, body, challenge_callback)
-        return (True, info, "web_form") if ok else _smtp_fallback(info)
+        return (True, info, "web_form") if ok else await _smtp_fallback(info)
+
     if method == "smtp":
-        ok, info = send_via_smtp(account, target_email, subject, body)
+        ok, info = await asyncio.to_thread(send_via_smtp, account, target_email, subject, body)
         return ok, info, "smtp"
+
     if method == "gmail_web":
         ok, info = await send_via_gmail_web(account, target_email, subject, body, challenge_callback)
-        return (True, info, "gmail_web") if ok else _smtp_fallback(info)
+        return (True, info, "gmail_web") if ok else await _smtp_fallback(info)
 
+    # auto: prefer an authenticated browser session, otherwise SMTP.
     if account.get("logged_in") or account.get("password") or account.get("cookies"):
         ok, info = await send_via_gethelp_form(account, body, challenge_callback)
-        return (True, info, "web_form") if ok else _smtp_fallback(info)
+        if ok:
+            return True, info, "web_form"
+        return await _smtp_fallback(info)
     if has_smtp:
-        ok, info = send_via_smtp(account, target_email, subject, body)
+        ok, info = await asyncio.to_thread(send_via_smtp, account, target_email, subject, body)
         return ok, info, "smtp"
     return False, "No valid credentials for account", method
