@@ -386,8 +386,7 @@ async def generate_report():
     client, model = _get_ai_client_and_model()
 
     if not client:
-        parts = template.split("
-", 1)
+        parts = template.split("\n", 1)
         subject = parts[0].replace("Subject:", "").strip()
         body = parts[1].strip() if len(parts) > 1 else template
         return {"subject": subject, "body": body}
@@ -399,19 +398,11 @@ async def generate_report():
         "2) User is traveling abroad and accessing the account across various international locations and Wi-Fi networks, causing a false-positive security flag. "
         "3) User is the sole authorized owner, all points and transactions were earned legitimately under Google Play Terms of Service, with no fraud. "
         "4) Request for manual review and reinstatement. "
-        "Do not invent order IDs or sensitive information. Output in English only.
-
-"
-        f"ORIGINAL TEXT:
-{template}
-
-"
-        "Return strictly in this format:
-"
-        "SUBJECT: <rewritten subject>
-"
-        "BODY:
-<rewritten body>"
+        "Do not invent order IDs or sensitive information. Output in English only.\n\n"
+        f"ORIGINAL TEXT:\n{template}\n\n"
+        "Return strictly in this format:\n"
+        "SUBJECT: <rewritten subject>\n"
+        "BODY:\n<rewritten body>"
     )
     try:
         resp = await client.chat.completions.create(
@@ -428,18 +419,15 @@ async def generate_report():
             if line.upper().startswith("SUBJECT:"):
                 subject = line.split(":", 1)[1].strip()
             elif line.upper().startswith("BODY:"):
-                body = "
-".join(lines[i + 1:]).strip()
+                body = "\n".join(lines[i + 1:]).strip()
                 break
         return {"subject": subject, "body": body}
     except Exception as e:
         logging.error(f"AI report generation failed: {e}")
-        parts = template.split("
-", 1)
+        parts = template.split("\n", 1)
         subject = parts[0].replace("Subject:", "").strip()
         body = parts[1].strip() if len(parts) > 1 else template
         return {"subject": subject, "body": body}
-
 
 def _build_smtp_message(sender_email, sender_name, to_email, subject, body):
     msg = MIMEMultipart()
