@@ -445,7 +445,14 @@ def seconds_until_next_send(settings: Optional[dict] = None, now: Optional[float
     now = time.time() if now is None else now
     interval = send_interval_seconds(settings)
     elapsed = now - float(state.get("last_send_ts") or 0)
-    return max(0, int(interval - elapsed))
+    remaining = max(0, int(interval - elapsed))
+
+    # A failed attempt must not be retried on the next scheduler tick, otherwise
+    # a broken account floods the chat with an error every 30 seconds.
+    backoff_until = float(state.get("backoff_until") or 0)
+    if backoff_until > now:
+        remaining = max(remaining, int(backoff_until - now))
+    return remaining
 
 
 def mark_global_send(email: str, when: Optional[float] = None) -> None:
@@ -455,8 +462,41 @@ def mark_global_send(email: str, when: Optional[float] = None) -> None:
         state["last_send_ts"] = when
         state["last_account"] = email
         state["rr_index"] = int(state.get("rr_index", 0)) + 1
+        state["failure_count"] = 0
+        state["backoff_until"] = 0
         save_scheduler_state(state)
     update_account(email, last_sent_at=when)
+
+
+FAILURE_BACKOFF_STEPS = (300, 900, 1800, 3600, 10800, 21600)
+
+
+def mark_failed_send(email: str, when: Optional[float] = None) -> int:
+    """Record a failed attempt and return the backoff applied, in seconds.
+
+    The delay escalates 5m → 15m → 30m → 1h → 3h → 6h so a permanently broken
+    account stops hammering the provider (and the user's chat) every tick.
+    """
+    when = time.time() if when is None else when
+    with _FILE_LOCK:
+        state = load_scheduler_state()
+        count = int(state.get("failure_count") or 0) + 1
+        index = min(count - 1, len(FAILURE_BACKOFF_STEPS) - 1)
+        delay = FAILURE_BACKOFF_STEPS[index]
+        state["failure_count"] = count
+        state["last_failure_ts"] = when
+        state["last_failed_account"] = email
+        state["backoff_until"] = when + delay
+        save_scheduler_state(state)
+    return delay
+
+
+def reset_failure_backoff() -> None:
+    with _FILE_LOCK:
+        state = load_scheduler_state()
+        state["failure_count"] = 0
+        state["backoff_until"] = 0
+        save_scheduler_state(state)
 
 
 def enqueue_accounts(emails: list[str]) -> int:

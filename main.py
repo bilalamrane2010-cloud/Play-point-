@@ -67,6 +67,16 @@ def is_authorized(update: Update) -> bool:
 def restricted(func):
     @functools.wraps(func)
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = getattr(update, "effective_user", None)
+        if user is not None:
+            # Printed so the owner can read their numeric ID from the logs and
+            # put it in ALLOWED_USER_IDS to lock the bot down.
+            logging.info(
+                "Update from user_id=%s username=@%s name=%s",
+                user.id,
+                user.username or "-",
+                user.full_name or "-",
+            )
         if not is_authorized(update):
             text = "⛔ غير مصرح لك باستخدام هذا البوت."
             if update.callback_query:
@@ -293,13 +303,18 @@ async def run_one_send(bot, chat_id: Optional[int], account: dict) -> tuple[bool
         )
     else:
         core.update_account(account["email"], last_status="فشل الإرسال ❌")
+        delay = core.mark_failed_send(account["email"])
         hint = ""
         if core._is_network_blocked(info):
             hint = (
                 "\n\n💡 منصة الاستضافة تحجب منافذ SMTP. الحل: أضف APPS_SCRIPT_URL "
                 "(ملف google_apps_script.gs) في متغيرات البيئة وسيعمل الإرسال عبر HTTPS."
             )
-        message = f"❌ فشل إرسال البلاغ ({account['email']})\nالسبب: {info}{hint}"
+        message = (
+            f"❌ فشل إرسال البلاغ ({account['email']})\n"
+            f"السبب: {info}{hint}\n\n"
+            f"⏳ تم إيقاف المحاولات مؤقتاً لمدة {_fmt_duration(delay)} لتجنب التكرار."
+        )
 
     targets = [chat_id] if chat_id is not None else list(NOTIFY_CHATS)
     for target in targets:
