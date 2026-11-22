@@ -1,0 +1,33 @@
+# --- runtime data (never bake user accounts/cookies into the image) ---
+bot_data/
+*.json.corrupt.*
+*.log
+
+# --- tests & dev tooling ---
+tests/
+pytest.ini
+.pytest_cache/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# --- git / editors / OS junk ---
+.git/
+.gitignore
+.vscode/
+.idea/
+.DS_Store
+
+# --- misc ---
+*.md
+Screenshot*.jpg
+part1.png
+part2.png
+ocr_full.png
+repo_check/
+outputs/
+summarized_conversations/
+.agent_hooks/
+.browser_data/
+.psiphon_data/
