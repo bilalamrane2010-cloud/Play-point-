@@ -43,7 +43,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Persist accounts/settings/scheduler state outside the container layer.
+# NOTE: the Dockerfile "VOLUME" instruction is NOT supported by Railway
+# (and is ignored by most PaaS builders). Mount a Railway Volume at
+# /app/bot_data instead, or point BOT_DATA_DIR at your mounted path.
 RUN mkdir -p /app/bot_data
-VOLUME ["/app/bot_data"]
 
 CMD ["python", "main.py"]
