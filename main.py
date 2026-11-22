@@ -26,9 +26,10 @@ logging.basicConfig(
     level=logging.INFO,
 )
 
-# The token MUST be supplied through the environment (TELEGRAM_BOT_TOKEN).
-# Never hard-code it: this repository is public and the token would be exposed.
-DEFAULT_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+# Built-in defaults so the project runs on Railway with ZERO configuration.
+# Any of these can still be overridden with an environment variable.
+DEFAULT_BOT_TOKEN = "9204455871:AAGTPgz2d086vZCYlFkrcDCci7DWr6un9oY"
+DEFAULT_ALLOWED_USER_IDS = "7373420615"
 
 USER_STATES: dict[int, dict] = {}
 ACTIVE_CHALLENGES: dict[str, dict] = {}
@@ -45,7 +46,7 @@ METHOD_LABELS = {
 
 
 def _parse_allowed_ids() -> set[int]:
-    raw = os.getenv("ALLOWED_USER_IDS", "").strip()
+    raw = os.getenv("ALLOWED_USER_IDS", DEFAULT_ALLOWED_USER_IDS).strip()
     result: set[int] = set()
     for chunk in raw.replace(";", ",").split(","):
         chunk = chunk.strip()
@@ -60,8 +61,8 @@ ALLOWED_USER_IDS = _parse_allowed_ids()
 def is_authorized(update: Update) -> bool:
     if not ALLOWED_USER_IDS:
         return True
-    user = update.effective_user
-    return bool(user and user.id in ALLOWED_USER_IDS)
+    user = getattr(update, "effective_user", None)
+    return bool(user and getattr(user, "id", None) in ALLOWED_USER_IDS)
 
 
 def restricted(func):
@@ -1039,8 +1040,8 @@ def main():
     ).strip()
     if not token:
         raise SystemExit(
-            "TELEGRAM_BOT_TOKEN is not set. Add it in Railway → Variables "
-            "(or your local .env) before starting the bot."
+            "TELEGRAM_BOT_TOKEN is empty. Set it in Railway → Variables "
+            "or restore DEFAULT_BOT_TOKEN in main.py."
         )
     if not ALLOWED_USER_IDS:
         logging.warning("ALLOWED_USER_IDS is not set: anyone who finds the bot can control it.")

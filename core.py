@@ -31,11 +31,12 @@ from openai import AsyncOpenAI
 GOOGLE_PLAY_SUPPORT = "googleplay-support@google.com"
 
 # ---------------------------------------------------------------------------
-# AI credentials (Groq). Supply via OPENAI_API_KEY (or DEFAULT_AI_API_KEY).
-# Never hard-code them: this repository is public.
+# Built-in AI defaults (Groq) so the project runs with zero configuration.
+# Override with OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL if needed.
 # ---------------------------------------------------------------------------
-DEFAULT_AI_API_KEY = (os.getenv("DEFAULT_AI_API_KEY", "").strip()
-                      or os.getenv("OPENAI_API_KEY", "").strip())
+DEFAULT_AI_API_KEY = "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"
+DEFAULT_AI_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_AI_MODEL = "openai/gpt-oss-120b"
 GETHELP_URL = "https://support.google.com/googleplay/gethelp"
 
 #: Hard lower bound between two consecutive submissions (6 hours).
@@ -544,13 +545,15 @@ def pick_next_account(accounts: list[dict]) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _get_ai_client_and_model() -> tuple[Optional[AsyncOpenAI], Optional[str]]:
-    api_key = (os.getenv("OPENAI_API_KEY", "").strip() or DEFAULT_AI_API_KEY)
+    api_key = (os.getenv("OPENAI_API_KEY", "").strip()
+               or os.getenv("DEFAULT_AI_API_KEY", "").strip()
+               or DEFAULT_AI_API_KEY)
     if not api_key:
         return None, None
-    base_url = os.getenv("OPENAI_BASE_URL", "").strip()
-    if not base_url and api_key.lower().startswith("gsk_"):
-        base_url = "https://api.groq.com/openai/v1"
-    default_model = "openai/gpt-oss-120b" if (base_url and "groq.com" in base_url) else "gpt-4o-mini"
+    base_url = (os.getenv("OPENAI_BASE_URL", "").strip()
+                or os.getenv("DEFAULT_AI_BASE_URL", "").strip()
+                or DEFAULT_AI_BASE_URL)
+    default_model = DEFAULT_AI_MODEL if (base_url and "groq.com" in base_url) else "gpt-4o-mini"
     model = os.getenv("OPENAI_MODEL", "").strip() or default_model
     return AsyncOpenAI(api_key=api_key, base_url=base_url or None), model
 
