@@ -1,18 +1,19 @@
-import os
-import json
-import time
-import random
 import asyncio
+import json
 import logging
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import os
+import random
+import time
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
-    CommandHandler,
     CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
     MessageHandler,
     filters,
-    ContextTypes,
 )
+
 import core
 
 logging.basicConfig(
@@ -30,23 +31,16 @@ def build_main_menu():
     auto_icon = "🟢" if s.get("auto_send_enabled") else "🔴"
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🚀 Instant Report", callback_data="menu_send_now"),
-            InlineKeyboardButton("🌐 Send via Support Form", callback_data="send_form_now"),
+            InlineKeyboardButton("🚀 إرسال بلاغ الآن", callback_data="menu_send_now"),
+            InlineKeyboardButton("👤 الحسابات", callback_data="menu_accounts"),
         ],
         [
-            InlineKeyboardButton("👤 Accounts Manager", callback_data="menu_accounts"),
-            InlineKeyboardButton("📱 Device & IP Identity", callback_data="menu_device"),
+            InlineKeyboardButton(f"{auto_icon} الإرسال التلقائي", callback_data="toggle_auto"),
+            InlineKeyboardButton("⏱️ الفاصل الزمني", callback_data="set_interval"),
         ],
         [
-            InlineKeyboardButton(f"{auto_icon} Auto Send", callback_data="toggle_auto"),
-            InlineKeyboardButton("⏱️ Send Interval", callback_data="set_interval"),
-        ],
-        [
-            InlineKeyboardButton("⚙️ Settings & Template", callback_data="menu_settings"),
-            InlineKeyboardButton("📊 Logs & Stats", callback_data="menu_stats"),
-        ],
-        [
-            InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="refresh_main"),
+            InlineKeyboardButton("⚙️ الإعدادات", callback_data="menu_settings"),
+            InlineKeyboardButton("📊 السجل", callback_data="menu_stats"),
         ],
     ])
 
@@ -55,23 +49,28 @@ def render_dashboard():
     accounts = core.load_accounts()
     s = core.load_settings()
     st = core.load_stats()
-    active_sessions = sum(1 for a in accounts if a.get("logged_in"))
     method_labels = {
-        "web_form": "Google Play GetHelp Form",
-        "smtp": "App Password (SMTP)",
-        "gmail_web": "Gmail Web",
-        "auto": "Smart Auto",
+        "auto": "تلقائي ذكي",
+        "web_form": "نموذج الدعم",
+        "smtp": "البريد المباشر",
+        "gmail_web": "ويب Gmail",
     }
     return (
-        "🛡️ Control Panel — Google Play Support\n"
-        "━━━━━━━━━━━━━━━━━━━━\n"
-        f"• Accounts: {len(accounts)} (Saved sessions: {active_sessions})\n"
-        f"• Auto Login on Add: {'Enabled ✅' if s.get('auto_login_on_add', True) else 'Disabled ⏸️'}\n"
-        f"• Auto Send: {'Enabled ✅' if s.get('auto_send_enabled') else 'Disabled ⏸️'}\n"
-        f"• Interval: Every {s.get('auto_send_interval', 60)} min\n"
-        f"• Channel: {method_labels.get(s.get('send_method', 'web_form'), 'auto')}\n"
-        f"• Stats: Success {st.get('total_sent', 0)} | Failed {st.get('failed', 0)}\n"
-        "━━━━━━━━━━━━━━━━━━━━"
+        "🛡️ لوحة التحكم
+"
+        "━━━━━━━━━━━━━━
+"
+        f"• الحسابات: {len(accounts)}
+"
+        f"• الإرسال التلقائي: {'مفعّل ✅' if s.get('auto_send_enabled') else 'متوقف ⏸️'}
+"
+        f"• كل: {s.get('auto_send_interval', 60)} دقيقة
+"
+        f"• الطريقة: {method_labels.get(s.get('send_method', 'auto'), 'تلقائي ذكي')}
+"
+        f"• تم الإرسال: {st.get('total_sent', 0)} | فشل: {st.get('failed', 0)}
+"
+        "━━━━━━━━━━━━━━"
     )
 
 
@@ -90,7 +89,7 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if ch["chat_id"] == chat_id and not ch["future"].done():
             ch["future"].set_result("/cancel")
     await update.message.reply_text(
-        "✅ Current action cancelled.",
+        "✅ تم إلغاء العملية.",
         reply_markup=build_main_menu(),
     )
 
@@ -104,10 +103,12 @@ async def send_challenge_to_telegram(bot, chat_id, email, challenge_type, screen
         "type": challenge_type,
     }
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Approved on Device", callback_data=f"ch_done::{email}")],
-        [InlineKeyboardButton("❌ Cancel Session", callback_data=f"ch_cancel::{email}")],
+        [InlineKeyboardButton("✅ تم التأكيد", callback_data=f"ch_done::{email}")],
+        [InlineKeyboardButton("❌ إلغاء", callback_data=f"ch_cancel::{email}")],
     ])
-    caption_str = f"🔐 Verification Required: {email}\n\n{prompt_text}"
+    caption_str = f"🔐 تحقق مطلوب للحساب: {email}
+
+{prompt_text}"
     sent_photo = False
     if screenshot_path and os.path.exists(screenshot_path):
         try:
@@ -160,7 +161,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ch = ACTIVE_CHALLENGES.get(email)
         if ch and not ch["future"].done():
             ch["future"].set_result("done")
-        await _safe_ack_challenge(q, "✅ Completing session...")
+        await _safe_ack_challenge(q, "✅ جاري المتابعة...")
         return
 
     if data.startswith("ch_cancel::"):
@@ -168,7 +169,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ch = ACTIVE_CHALLENGES.get(email)
         if ch and not ch["future"].done():
             ch["future"].set_result("/cancel")
-        await _safe_ack_challenge(q, "❌ Session cancelled.")
+        await _safe_ack_challenge(q, "❌ تم الإلغاء.")
         return
 
     if data in ("refresh_main", "back_main"):
@@ -191,49 +192,34 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "set_interval":
         USER_STATES[chat_id] = {"step": "set_interval"}
-        await q.edit_message_text(
-            "⏱️ Send auto-send interval in minutes (e.g., 30 or 60), or /cancel:"
-        )
+        await q.edit_message_text("⏱️ أرسل الفاصل الزمني بالدقائق (مثال: 60) أو /cancel:")
         return
 
     if data == "menu_send_now":
         accounts = core.load_accounts()
         if not accounts:
             await q.edit_message_text(
-                "❌ No accounts found.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]),
+                "❌ لا توجد حسابات مضافة بعد.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_main")]]),
             )
             return
         kb = [[InlineKeyboardButton(f"📨 {a['email']}", callback_data=f"run_send::{a['email']}")] for a in accounts]
-        kb.append([InlineKeyboardButton("🎲 Random Account", callback_data="run_send::RANDOM")])
-        kb.append([InlineKeyboardButton("🔙 Back", callback_data="back_main")])
-        await q.edit_message_text("Select account for instant report:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data == "send_form_now":
-        accounts = core.load_accounts()
-        if not accounts:
-            await q.edit_message_text(
-                "❌ Add an account first.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]),
-            )
-            return
-        acc = random.choice(accounts)
-        await q.edit_message_text(f"⏳ Opening Google Play GetHelp form for {acc['email']}...")
-        asyncio.create_task(execute_report_task(context.bot, chat_id, acc, force_method="web_form"))
+        kb.append([InlineKeyboardButton("🎲 حساب عشوائي", callback_data="run_send::RANDOM")])
+        kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="back_main")])
+        await q.edit_message_text("اختر الحساب للإرسال:", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data.startswith("run_send::"):
         target = data.split("::", 1)[1]
         accounts = core.load_accounts()
         if not accounts:
-            await q.edit_message_text("❌ No accounts found.")
+            await q.edit_message_text("❌ لا توجد حسابات.")
             return
         acc = random.choice(accounts) if target == "RANDOM" else core.get_account(target)
         if not acc:
-            await q.edit_message_text("❌ Account not found.")
+            await q.edit_message_text("❌ الحساب غير موجود.")
             return
-        await q.edit_message_text(f"⏳ Generating AI appeal and sending from {acc['email']}...")
+        await q.edit_message_text(f"⏳ جاري إرسال البلاغ من {acc['email']}...")
         asyncio.create_task(execute_report_task(context.bot, chat_id, acc))
         return
 
@@ -241,36 +227,35 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         accounts = core.load_accounts()
         kb = [
             [
-                InlineKeyboardButton("➕ Add Account", callback_data="acc_add_choose_mode"),
-                InlineKeyboardButton("📋 List Accounts", callback_data="acc_list"),
+                InlineKeyboardButton("➕ إضافة حساب", callback_data="acc_add_choose_mode"),
+                InlineKeyboardButton("📋 قائمة الحسابات", callback_data="acc_list"),
             ],
             [
-                InlineKeyboardButton("✏️ Edit Account", callback_data="acc_edit_select"),
-                InlineKeyboardButton("🗑️ Delete Account", callback_data="acc_del_select"),
+                InlineKeyboardButton("✏️ تعديل حساب", callback_data="acc_edit_select"),
+                InlineKeyboardButton("🗑️ حذف حساب", callback_data="acc_del_select"),
             ],
             [
-                InlineKeyboardButton("🔐 Login & Save Session", callback_data="acc_login_select"),
-                InlineKeyboardButton("🧪 Test SMTP", callback_data="acc_test_select"),
+                InlineKeyboardButton("🔐 تسجيل دخول", callback_data="acc_login_select"),
+                InlineKeyboardButton("🧪 فحص البريد", callback_data="acc_test_select"),
             ],
             [
-                InlineKeyboardButton("💾 Export JSON", callback_data="acc_export"),
-                InlineKeyboardButton("🔙 Back", callback_data="back_main"),
+                InlineKeyboardButton("🔙 رجوع", callback_data="back_main"),
             ],
         ]
         await q.edit_message_text(
-            f"👤 Accounts Manager ({len(accounts)})",
+            f"👤 إدارة الحسابات ({len(accounts)})",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
 
     if data == "acc_add_choose_mode":
         kb = [
-            [InlineKeyboardButton("📧 Email + Password (Auto Login)", callback_data="acc_add_mode::email_code")],
-            [InlineKeyboardButton("🔑 Email + App Password (SMTP)", callback_data="acc_add_mode::app_password")],
-            [InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")],
+            [InlineKeyboardButton("🔑 بريد + App Password (مستحسن)", callback_data="acc_add_mode::app_password")],
+            [InlineKeyboardButton("📧 بريد + كلمة المرور", callback_data="acc_add_mode::email_code")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")],
         ]
         await q.edit_message_text(
-            "➕ Choose Login / Add Method:",
+            "اختر طريقة إضافة الحساب:",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -278,90 +263,33 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("acc_add_mode::"):
         mode = data.split("::", 1)[1]
         USER_STATES[chat_id] = {"step": "add_email", "auth_type": mode}
-        label = "Email + Password (Auto Login)" if mode == "email_code" else "Email + App Password (SMTP)"
-        await q.edit_message_text(
-            f"📧 Method: {label}\nSend Gmail address (Name & Surname are extracted automatically):"
-        )
-        return
-
-    if data == "menu_device":
-        accounts = core.load_accounts()
-        lines = ["📱 Device & IP Identities"]
-        for a in accounts:
-            lock = "🔒 Locked" if a.get("logged_in") else "🔄 Hourly Rotation"
-            lines.append(
-                f"• {a['email']} [{lock}]\n"
-                f"  Phone: {a.get('device_name') or 'Pending'} | ID: {a.get('device_id') or 'Pending'}\n"
-                f"  IP: {a.get('ip_address') or 'Auto'} | TZ: {a.get('timezone') or 'Africa/Algiers'}"
-            )
-        if len(lines) == 1:
-            lines.append("No accounts configured yet.")
-        kb = [
-            [InlineKeyboardButton("🎲 Rotate Unlogged Devices Now", callback_data="rotate_devices_now")],
-            [InlineKeyboardButton("✏️ Set Device / IP for Account", callback_data="set_dev_ip_select")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
-        ]
-        await q.edit_message_text(
-            "\n".join(lines)[:3900],
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-        return
-
-    if data == "set_dev_ip_select":
-        accounts = core.load_accounts()
-        if not accounts:
-            await q.edit_message_text("No accounts found.")
-            return
-        kb = [[InlineKeyboardButton(a["email"], callback_data=f"set_dev_ip_acc::{a['email']}")] for a in accounts]
-        kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_device")])
-        await q.edit_message_text("Select account to set Phone Name, Device ID & IP:", reply_markup=InlineKeyboardMarkup(kb))
-        return
-
-    if data.startswith("set_dev_ip_acc::"):
-        email = data.split("::", 1)[1]
-        USER_STATES[chat_id] = {"step": "set_dev_ip_val", "email": email}
-        await q.edit_message_text(
-            f"📱 Send for {email} in format:\nPhone Name | Device ID | IP Address\nExample:\nXiaomi Redmi Note 12 Pro 5G | 22101316I-001 | 105.104.22.14"
-        )
-        return
-
-    if data == "rotate_devices_now":
-        accounts = core.load_accounts()
-        rotated = 0
-        for a in accounts:
-            if not a.get("logged_in"):
-                await core.ensure_account_session_identity(a, force_rotate=True)
-                rotated += 1
-        await q.edit_message_text(
-            f"✅ Rotated device & IP identity for {rotated} unlogged accounts.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_device")]]),
-        )
+        await q.edit_message_text("📧 أرسل عنوان البريد الإلكتروني (Gmail):")
         return
 
     if data == "acc_list":
         accounts = core.load_accounts()
         if not accounts:
             await q.edit_message_text(
-                "No accounts saved.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")]]),
+                "لا توجد حسابات محفوظة.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")]]),
             )
             return
         blocks = []
         for a in accounts:
-            sess = "Saved 🔒" if a.get("logged_in") else "Not logged in"
-            mode_txt = "Email+Pass" if a.get("auth_type", "email_code") == "email_code" else "App Password"
             blocks.append(
-                f"• {a['email']} — {a.get('first_name', '')} {a.get('last_name', '')} [{mode_txt}]\n"
-                f"  Session: {sess} | Status: {a.get('last_status', 'New')}\n"
-                f"  Phone: {a.get('device_name') or 'Auto'} ({a.get('device_id') or 'Auto'})\n"
-                f"  IP: {a.get('ip_address') or 'Auto'} | Sent: {a.get('sent', 0)}"
+                f"• {a['email']}
+"
+                f"  الحالة: {a.get('last_status', 'جديد')} | المرسل: {a.get('sent', 0)}"
             )
-        text = "\n\n".join(blocks)
+        text = "
+
+".join(blocks)
         if len(text) > 3900:
-            text = text[:3900] + "\n..."
+            text = text[:3900] + "
+..."
         await q.edit_message_text(
             text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")]]),
         )
         return
 
@@ -369,8 +297,8 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         accounts = core.load_accounts()
         if not accounts:
             await q.edit_message_text(
-                "No accounts found.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")]]),
+                "لا توجد حسابات.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")]]),
             )
             return
         prefix_map = {
@@ -381,21 +309,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         prefix = prefix_map[data]
         kb = [[InlineKeyboardButton(a["email"], callback_data=f"{prefix}::{a['email']}")] for a in accounts]
-        kb.append([InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")])
-        await q.edit_message_text("Select account:", reply_markup=InlineKeyboardMarkup(kb))
+        kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")])
+        await q.edit_message_text("اختر الحساب:", reply_markup=InlineKeyboardMarkup(kb))
         return
 
     if data.startswith("acc_edit_menu::"):
         email = data.split("::", 1)[1]
         kb = [
-            [InlineKeyboardButton("🔑 Edit App Password", callback_data=f"edit_field::{email}::app_password")],
-            [InlineKeyboardButton("🔒 Edit Password", callback_data=f"edit_field::{email}::password")],
-            [InlineKeyboardButton("🪪 Edit First & Last Name", callback_data=f"edit_field::{email}::fullname")],
-            [InlineKeyboardButton("🔓 Reset Session (Allow Device Rotation)", callback_data=f"reset_sess::{email}")],
-            [InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")],
+            [InlineKeyboardButton("🔑 تعديل App Password", callback_data=f"edit_field::{email}::app_password")],
+            [InlineKeyboardButton("🔒 تعديل كلمة المرور", callback_data=f"edit_field::{email}::password")],
+            [InlineKeyboardButton("🪪 تعديل الاسم", callback_data=f"edit_field::{email}::fullname")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")],
         ]
         await q.edit_message_text(
-            f"✏️ Edit Account: {email}",
+            f"✏️ تعديل الحساب: {email}",
             reply_markup=InlineKeyboardMarkup(kb),
         )
         return
@@ -404,28 +331,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, email, field = data.split("::", 2)
         USER_STATES[chat_id] = {"step": "edit_account_field", "email": email, "field": field}
         prompts = {
-            "app_password": "Send new App Password (16 chars) or /clear:",
-            "password": "Send new Account Password or /clear:",
-            "fullname": "Send First and Last Name separated by space (e.g., Bilal Amran):",
+            "app_password": "أرسل App Password الجديد (16 حرفاً) أو /clear:",
+            "password": "أرسل كلمة المرور الجديدة أو /clear:",
+            "fullname": "أرسل الاسم الأول واللقب (مثال: Bilal Amran):",
         }
         await q.edit_message_text(prompts[field])
-        return
-
-    if data.startswith("reset_sess::"):
-        email = data.split("::", 1)[1]
-        core.update_account(email, logged_in=False, identity_updated_at=0, last_status="Session reset")
-        await q.edit_message_text(
-            f"✅ Session reset for {email}. Device identity will rotate on next login.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")]]),
-        )
         return
 
     if data.startswith("acc_del_confirm::"):
         email = data.split("::", 1)[1]
         core.remove_account(email)
         await q.edit_message_text(
-            f"🗑️ Deleted account {email}.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")]]),
+            f"🗑️ تم حذف الحساب {email}.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")]]),
         )
         return
 
@@ -433,12 +351,9 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         email = data.split("::", 1)[1]
         acc = core.get_account(email)
         if not acc:
-            await q.edit_message_text("❌ Account not found.")
+            await q.edit_message_text("❌ الحساب غير موجود.")
             return
-        await q.edit_message_text(
-            f"🔐 Starting login session for {email}...\n"
-            "Verification code / 2FA prompts or screenshots will appear here."
-        )
+        await q.edit_message_text(f"🔐 جاري تسجيل الدخول للحساب {email}...")
         asyncio.create_task(execute_login_only(context.bot, chat_id, acc))
         return
 
@@ -446,98 +361,88 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         email = data.split("::", 1)[1]
         acc = core.get_account(email)
         if not acc:
-            await q.edit_message_text("❌ Account not found.")
+            await q.edit_message_text("❌ الحساب غير موجود.")
             return
-        await q.edit_message_text("⏳ Testing SMTP connection...")
+        await q.edit_message_text("⏳ جاري فحص الاتصال...")
         if acc.get("app_password"):
             ok, info = core.test_smtp(acc)
-            res = f"App Password SMTP: {'OK ✅' if ok else 'Failed ❌ (' + info + ')'}"
+            res = "متصل بنجاح ✅" if ok else f"فشل الاتصال ❌ ({info})"
         else:
-            res = "App Password SMTP: Not set"
+            res = "غير مضبوط"
         await q.edit_message_text(
-            f"🧪 Test Result: {email}\n• {res}\n• Session: {'Saved 🔒' if acc.get('logged_in') else 'Not logged in'}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")]]),
-        )
-        return
-
-    if data == "acc_export":
-        payload = json.dumps(core.load_accounts(), ensure_ascii=False, indent=2)
-        if len(payload) > 3800:
-            payload = payload[:3800] + "\n..."
-        await q.edit_message_text(
-            payload,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_accounts")]]),
+            f"🧪 نتيجة الفحص ({email}):
+• البريد المباشر: {res}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")]]),
         )
         return
 
     if data == "menu_settings":
         s = core.load_settings()
-        auto_login_txt = "ON ✅" if s.get("auto_login_on_add", True) else "OFF ❌"
+        method_labels = {
+            "auto": "تلقائي ذكي",
+            "web_form": "نموذج الدعم",
+            "smtp": "البريد المباشر",
+            "gmail_web": "ويب Gmail",
+        }
+        cur_label = method_labels.get(s.get("send_method", "auto"), "تلقائي ذكي")
         kb = [
-            [InlineKeyboardButton(f"📤 Method: {s.get('send_method', 'web_form')}", callback_data="cycle_method")],
-            [InlineKeyboardButton(f"⚡ Auto Login on Add: {auto_login_txt}", callback_data="toggle_auto_login")],
-            [InlineKeyboardButton("📝 Edit Base Appeal Template", callback_data="edit_template")],
-            [InlineKeyboardButton("📧 Edit Target Email", callback_data="edit_target")],
-            [InlineKeyboardButton(f"⏳ Delay: {s.get('min_delay', 25)}-{s.get('max_delay', 90)}s", callback_data="edit_delays")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back_main")],
+            [InlineKeyboardButton(f"📤 طريقة الإرسال: {cur_label}", callback_data="cycle_method")],
+            [InlineKeyboardButton("📝 تعديل نص البلاغ", callback_data="edit_template")],
+            [InlineKeyboardButton(f"⏳ التأخير: {s.get('min_delay', 25)}-{s.get('max_delay', 90)} ث", callback_data="edit_delays")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="back_main")],
         ]
         await q.edit_message_text(
-            "⚙️ Settings & Template",
+            "⚙️ الإعدادات",
             reply_markup=InlineKeyboardMarkup(kb),
-        )
-        return
-
-    if data == "toggle_auto_login":
-        s = core.load_settings()
-        s["auto_login_on_add"] = not s.get("auto_login_on_add", True)
-        core.save_settings(s)
-        await q.edit_message_text(
-            f"✅ Auto Login on Add set to: {'Enabled' if s['auto_login_on_add'] else 'Disabled'}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_settings")]]),
         )
         return
 
     if data == "cycle_method":
         s = core.load_settings()
-        modes = ["web_form", "smtp", "gmail_web", "auto"]
-        cur = s.get("send_method", "web_form")
+        modes = ["auto", "web_form", "smtp", "gmail_web"]
+        cur = s.get("send_method", "auto")
+        if cur not in modes:
+            cur = "auto"
         s["send_method"] = modes[(modes.index(cur) + 1) % len(modes)]
         core.save_settings(s)
+        method_labels = {
+            "auto": "تلقائي ذكي",
+            "web_form": "نموذج الدعم",
+            "smtp": "البريد المباشر",
+            "gmail_web": "ويب Gmail",
+        }
         await q.edit_message_text(
-            f"✅ Send method updated to: {s['send_method']}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu_settings")]]),
+            f"✅ تم التغيير إلى: {method_labels[s['send_method']]}",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_settings")]]),
         )
         return
 
     if data == "edit_template":
         USER_STATES[chat_id] = {"step": "edit_template"}
-        await q.edit_message_text("📝 Send new base appeal template text:")
-        return
-
-    if data == "edit_target":
-        USER_STATES[chat_id] = {"step": "edit_target"}
-        await q.edit_message_text("📧 Send target email address:")
+        await q.edit_message_text("📝 أرسل نص البلاغ الأساسي الجديد:")
         return
 
     if data == "edit_delays":
         USER_STATES[chat_id] = {"step": "edit_delays"}
-        await q.edit_message_text("⏳ Send min and max delay in seconds (e.g., 20 60):")
+        await q.edit_message_text("⏳ أرسل أقل وأقصى مدة انتظار بالثواني (مثال: 25 90):")
         return
 
     if data == "menu_stats":
         st = core.load_stats()
         lines = [
-            "📊 Statistics",
-            f"• Success: {st.get('total_sent', 0)}",
-            f"• Failed: {st.get('failed', 0)}",
-            "\nLast 10 runs:",
+            "📊 إحصائيات الإرسال",
+            f"• ناجح: {st.get('total_sent', 0)}",
+            f"• فاشل: {st.get('failed', 0)}",
+            "
+آخر العمليات:",
         ]
         for h in reversed(st.get("history", [])[-10:]):
             icon = "✅" if h["success"] else "❌"
-            lines.append(f"{icon} {h['email']} — [{h.get('channel', 'auto')}]")
+            lines.append(f"{icon} {h['email']}")
         await q.edit_message_text(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="back_main")]]),
+            "
+".join(lines),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_main")]]),
         )
         return
 
@@ -553,30 +458,28 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     for email, ch in list(ACTIVE_CHALLENGES.items()):
         if ch["chat_id"] == chat_id and not ch["future"].done():
             ch["future"].set_result(text)
-            await update.message.reply_text("⏳ Received input, continuing session...")
+            await update.message.reply_text("⏳ تم الاستلام، جاري المتابعة...")
             return
 
     state = USER_STATES.get(chat_id)
     if not state:
-        await update.message.reply_text("Use /start to open control panel.")
+        await update.message.reply_text("أرسل /start لفتح القائمة الرئيسية.")
         return
 
     step = state["step"]
 
     if step == "add_email":
         if "@" not in text or "." not in text:
-            await update.message.reply_text("❌ Invalid email. Try again:")
+            await update.message.reply_text("❌ بريد إلكتروني غير صالح، حاول مجدداً:")
             return
         state["email"] = text
-        auth_type = state.get("auth_type", "email_code")
+        auth_type = state.get("auth_type", "app_password")
         if auth_type == "app_password":
             state["step"] = "add_app_password"
-            await update.message.reply_text("🔑 Send App Password (16 chars):")
+            await update.message.reply_text("🔑 أرسل App Password (16 حرفاً):")
         else:
             state["step"] = "add_password"
-            await update.message.reply_text(
-                "🔒 Send Account Password (login starts immediately after saving):"
-            )
+            await update.message.reply_text("🔒 أرسل كلمة مرور الحساب:")
         return
 
     if step == "add_app_password":
@@ -587,11 +490,8 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             auth_type="app_password",
         )
         USER_STATES.pop(chat_id, None)
-        acc = core.get_account(state["email"])
-        name_str = f"{acc['first_name']} {acc['last_name']}" if acc else ""
         await update.message.reply_text(
-            f"✅ Saved account {state['email']} (Name: {name_str}) via App Password."
-            if added else "❌ Account already exists.",
+            f"✅ تم حفظ الحساب {state['email']} بنجاح." if added else "❌ الحساب مضاف مسبقاً.",
             reply_markup=build_main_menu(),
         )
         return
@@ -606,38 +506,16 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         USER_STATES.pop(chat_id, None)
         acc = core.get_account(state["email"])
         if not added or not acc:
-            await update.message.reply_text("❌ Account already exists.", reply_markup=build_main_menu())
+            await update.message.reply_text("❌ الحساب مضاف مسبقاً.", reply_markup=build_main_menu())
             return
 
         await update.message.reply_text(
-            f"✅ Saved {acc['email']}\n"
-            f"📱 Phone: {acc.get('device_name')} | ID: {acc.get('device_id')}\n"
-            f"🌐 IP: {acc.get('ip_address')}\n"
-            f"🔐 Starting direct login now...",
+            f"✅ تم حفظ الحساب {acc['email']}.",
             reply_markup=build_main_menu(),
         )
         s = core.load_settings()
         if s.get("auto_login_on_add", True):
             asyncio.create_task(execute_login_only(context.bot, chat_id, acc))
-        return
-
-    if step == "set_dev_ip_val":
-        email = state["email"]
-        parts = [p.strip() for p in text.split("|")]
-        updates = {}
-        if len(parts) >= 1 and parts[0]:
-            updates["device_name"] = parts[0]
-        if len(parts) >= 2 and parts[1]:
-            updates["device_id"] = parts[1]
-        if len(parts) >= 3 and parts[2]:
-            updates["ip_address"] = parts[2]
-        if updates:
-            core.update_account(email, **updates)
-        USER_STATES.pop(chat_id, None)
-        await update.message.reply_text(
-            f"✅ Updated device/IP identity for {email}.",
-            reply_markup=build_main_menu(),
-        )
         return
 
     if step == "edit_account_field":
@@ -650,7 +528,7 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             core.update_account(email, **{field: "" if text.lower() == "/clear" else text})
         USER_STATES.pop(chat_id, None)
         await update.message.reply_text(
-            f"✅ Updated {email}.",
+            "✅ تم تحديث بيانات الحساب.",
             reply_markup=build_main_menu(),
         )
         return
@@ -663,11 +541,11 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             core.save_settings(s)
             USER_STATES.pop(chat_id, None)
             await update.message.reply_text(
-                f"✅ Interval set to {mins} minutes.",
+                f"✅ تم ضبط الفاصل الزمني إلى {mins} دقيقة.",
                 reply_markup=build_main_menu(),
             )
         except ValueError:
-            await update.message.reply_text("❌ Enter a valid integer.")
+            await update.message.reply_text("❌ يرجى إدخال رقم صحيح.")
         return
 
     if step == "edit_template":
@@ -675,15 +553,7 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         s["base_template"] = text
         core.save_settings(s)
         USER_STATES.pop(chat_id, None)
-        await update.message.reply_text("✅ Base template updated.", reply_markup=build_main_menu())
-        return
-
-    if step == "edit_target":
-        s = core.load_settings()
-        s["target_email"] = text
-        core.save_settings(s)
-        USER_STATES.pop(chat_id, None)
-        await update.message.reply_text(f"✅ Target email updated to {text}.", reply_markup=build_main_menu())
+        await update.message.reply_text("✅ تم تحديث نص البلاغ.", reply_markup=build_main_menu())
         return
 
     if step == "edit_delays":
@@ -694,9 +564,12 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             s["max_delay"] = max(p1, p2)
             core.save_settings(s)
             USER_STATES.pop(chat_id, None)
-            await update.message.reply_text(f"✅ Delay set to {s['min_delay']}–{s['max_delay']}s.", reply_markup=build_main_menu())
+            await update.message.reply_text(
+                f"✅ تم ضبط التأخير إلى {s['min_delay']}–{s['max_delay']} ثانية.",
+                reply_markup=build_main_menu(),
+            )
         except Exception:
-            await update.message.reply_text("❌ Send two numbers separated by space, e.g.: 25 90")
+            await update.message.reply_text("❌ أرسل رقمين مفصولين بمسافة (مثال: 25 90).")
         return
 
 
@@ -711,19 +584,12 @@ async def execute_login_only(bot, chat_id, account):
         driver = core._build_chrome_driver(account)
         ok, msg = await core._interactive_google_login(driver, account, cb)
         if ok:
-            fn, ln = core.extract_and_save_profile_names(driver, account)
-            await bot.send_message(
-                chat_id,
-                f"✅ Session Saved!\n"
-                f"• Account: {account['email']}\n"
-                f"• Name: {fn} {ln}\n"
-                f"• Phone: {account.get('device_name')} ({account.get('device_id')})\n"
-                f"• IP: {account.get('ip_address')}",
-            )
+            core.extract_and_save_profile_names(driver, account)
+            await bot.send_message(chat_id, f"✅ تم تسجيل الدخول بنجاح: {account['email']}")
         else:
-            await bot.send_message(chat_id, f"❌ Login failed ({account['email']}): {msg}")
+            await bot.send_message(chat_id, f"❌ تعذر تسجيل الدخول ({account['email']}): {msg}")
     except Exception as e:
-        await bot.send_message(chat_id, f"❌ Error: {core._format_exc(e)}")
+        await bot.send_message(chat_id, f"❌ حدث خطأ: {core._format_exc(e)}")
     finally:
         if driver:
             try:
@@ -734,36 +600,36 @@ async def execute_login_only(bot, chat_id, account):
 
 async def execute_report_task(bot, chat_id, account, force_method=None):
     s = core.load_settings()
-    method = force_method or s.get("send_method", "web_form")
+    method = force_method or s.get("send_method", "auto")
     report = await core.generate_report()
 
     async def cb(email, ctype, shot, prompt_txt):
         return await send_challenge_to_telegram(bot, chat_id, email, ctype, shot, prompt_txt)
 
-    ok, info = await core.dispatch_report(
+    ok, info, used_channel = await core.dispatch_report(
         account,
         report["subject"],
         report["body"],
         method=method,
         challenge_callback=cb,
     )
-    core.record_stat(account["email"], ok, method, report["subject"])
+    core.record_stat(account["email"], ok, used_channel, report["subject"])
     if ok:
-        core.update_account(account["email"], sent=account.get("sent", 0) + 1, last_status="Sent OK")
-        snippet = report["body"][:350] + ("..." if len(report["body"]) > 350 else "")
+        core.update_account(account["email"], sent=account.get("sent", 0) + 1, last_status="تم الإرسال ✅")
         await bot.send_message(
             chat_id,
-            f"✅ Appeal Submitted!\n"
-            f"• Account: {account['email']}\n"
-            f"• Method: {method}\n"
-            f"• Subject: {report['subject']}\n\n"
-            f"📄 Generated Text:\n{snippet}",
+            f"✅ تم إرسال البلاغ بنجاح
+"
+            f"• الحساب: {account['email']}
+"
+            f"• العنوان: {report['subject']}",
         )
     else:
-        core.update_account(account["email"], last_status=f"Failed: {info}")
+        core.update_account(account["email"], last_status="فشل الإرسال ❌")
         await bot.send_message(
             chat_id,
-            f"❌ Submission Failed ({account['email']})\nReason: {info}",
+            f"❌ فشل إرسال البلاغ ({account['email']})
+السبب: {info}",
         )
 
 
@@ -782,11 +648,11 @@ async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
     LAST_AUTO_RUN["ts"] = now
     acc = random.choice(accounts)
     report = await core.generate_report()
-    method = s.get("send_method", "web_form")
-    ok, _ = await core.dispatch_report(acc, report["subject"], report["body"], method=method)
-    core.record_stat(acc["email"], ok, method, report["subject"])
+    method = s.get("send_method", "auto")
+    ok, _, used_channel = await core.dispatch_report(acc, report["subject"], report["body"], method=method)
+    core.record_stat(acc["email"], ok, used_channel, report["subject"])
     if ok:
-        core.update_account(acc["email"], sent=acc.get("sent", 0) + 1)
+        core.update_account(acc["email"], sent=acc.get("sent", 0) + 1, last_status="تم الإرسال ✅")
 
     delay = random.randint(s.get("min_delay", 25), s.get("max_delay", 90))
     await asyncio.sleep(delay)
