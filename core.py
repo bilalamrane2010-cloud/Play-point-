@@ -974,23 +974,96 @@ def _is_insecure_browser_block(driver) -> bool:
 
 
 def _has_real_captcha_challenge(driver) -> bool:
+    """Detect a *visible* CAPTCHA challenge.
+
+    Google preloads a hidden ``<img alt="CAPTCHA image ...">`` (with no ``src``)
+    on the ordinary sign-in page. Treating that as a challenge made the bot ask
+    the user for a code that did not exist, so the flow always ended in
+    "Cancelled". We now require the widget to be actually displayed and, for a
+    text CAPTCHA, to be paired with a visible text input.
+    """
     try:
         from selenium.webdriver.common.by import By
 
         if _is_insecure_browser_block(driver):
             return False
+
         current = (driver.current_url or "").lower()
-        if "recaptcha" in current or "captcha" in current:
+        # Google's real "unusual traffic" interstitial.
+        if "/sorry/" in current or "recaptcha/api" in current:
             return True
-        frames = driver.find_elements(
-            By.CSS_SELECTOR, "iframe[src*='recaptcha'], iframe[title*='recaptcha'], iframe[src*='captcha']"
-        )
-        if frames:
-            return True
-        images = driver.find_elements(By.CSS_SELECTOR, "img[src*='captcha'], img[alt*='captcha' i]")
-        return bool(images)
+
+        # A visible reCAPTCHA challenge frame (the checkbox is ~76px tall).
+        for frame in driver.find_elements(
+            By.CSS_SELECTOR,
+            "iframe[src*='recaptcha'], iframe[title*='recaptcha' i], iframe[src*='captcha']",
+        ):
+            try:
+                if not frame.is_displayed():
+                    continue
+                if (frame.size or {}).get("height", 0) >= 60:
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+
+        # A visible text CAPTCHA image must come with a visible text box.
+        visible_image = False
+        for image in driver.find_elements(
+            By.CSS_SELECTOR, "img[src*='captcha'], img[alt*='captcha' i]"
+        ):
+            try:
+                if image.is_displayed() and (image.get_attribute("src") or "").strip():
+                    visible_image = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
+        if not visible_image:
+            return False
+
+        for field in driver.find_elements(
+            By.CSS_SELECTOR,
+            "input[type='text'], input[name*='captcha' i], input[id*='captcha' i]",
+        ):
+            try:
+                if field.is_displayed() and field.is_enabled():
+                    return True
+            except Exception:  # noqa: BLE001
+                continue
+        return False
     except Exception:  # noqa: BLE001
         return False
+
+
+def _describe_verification_challenge(driver) -> tuple[str, str]:
+    """Return ``(kind, prompt)`` describing the current Google challenge page.
+
+    ``kind`` is one of ``phone`` (approve on the phone), ``code`` (type a code),
+    ``tap`` (tap a number on the phone) or ``generic``.
+    """
+    text = _page_text(driver)
+
+    if "check your phone" in text or "tap yes" in text or "notification" in text and "phone" in text:
+        return (
+            "phone",
+            "Google أرسل إشعاراً إلى هاتفك. افتح الإشعار واضغط Yes، ثم اضغط الرقم الظاهر على الشاشة، "
+            "وبعد أن يكتمل التحقق اضغط زر «تم التأكيد» بالأسفل.",
+        )
+    if "tap the number" in text or "tap the matching number" in text or "choose the number" in text:
+        return (
+            "tap",
+            "Google يطلب تأكيداً على هاتفك: اضغط الرقم المطابق في هاتفك، ثم اضغط «تم التأكيد».",
+        )
+    if "enter the code" in text or "verification code" in text or "get a verification code" in text:
+        return (
+            "code",
+            "أرسل رمز التحقق الذي وصلك (بريد/هاتف) هنا، أو اضغط «تم التأكيد» بعد إتمام التحقق.",
+        )
+    if "2-step" in text or "two-step" in text or "authenticator" in text:
+        return ("code", "أدخل رمز المصادقة الثنائية (2FA) هنا.")
+    return (
+        "generic",
+        "Google يطلب تحققاً إضافياً. اتبع التعليمات الظاهرة في الصورة، ثم اضغط «تم التأكيد».",
+    )
 
 
 def extract_and_save_profile_names(driver, account: dict) -> tuple[str, str]:
@@ -1037,7 +1110,7 @@ def extract_and_save_profile_names(driver, account: dict) -> tuple[str, str]:
     return first_name, last_name
 
 
-async def _interactive_google_login(driver, account: dict, challenge_callback=None, timeout: int = 180) -> tuple[bool, str]:
+async def _interactive_google_login(driver, account: dict, challenge_callback=None, timeout: int = 300) -> tuple[bool, str]:
     from selenium.webdriver.common.by import By
     from selenium.webdriver.common.keys import Keys
     from selenium.webdriver.support import expected_conditions as EC
@@ -1127,6 +1200,14 @@ async def _interactive_google_login(driver, account: dict, challenge_callback=No
             return False, "Google blocked sign-in ('This browser or app may not be secure')."
 
         current = driver.current_url or ""
+
+        if "rejected" in current or "/denied" in current:
+            update_account(account["email"], last_status="Verification rejected by Google")
+            return False, (
+                "Google رفض التحقق: لم يتم الضغط على Yes في الهاتف خلال المهلة. "
+                "أعد المحاولة وأكمل التأكيد من هاتفك بسرعة."
+            )
+
         if any(domain in current for domain in ("myaccount.google.com", "mail.google.com", "support.google.com")):
             if "signin" not in current and "challenge" not in current:
                 extract_and_save_profile_names(driver, account)
@@ -1135,25 +1216,33 @@ async def _interactive_google_login(driver, account: dict, challenge_callback=No
 
         if "challenge" in current and not notified_2fa and challenge_callback:
             notified_2fa = True
+            kind, prompt = _describe_verification_challenge(driver)
             shot = _capture_screenshot(driver, account["email"])
             reply = await challenge_callback(
                 account["email"],
                 "2fa",
                 shot,
-                "Verification code / 2FA required: send the code from your email/phone or approve and tap Done:",
+                prompt,
             )
             if reply and reply.lower() == "/cancel":
                 return False, "2FA cancelled"
             if reply and reply.lower() not in ("done", "ok"):
+                # Only type when the page really exposes an input field.
                 try:
-                    code_input = driver.find_element(
-                        By.CSS_SELECTOR, "input[type='tel'], input[type='text'], input[type='number']"
+                    candidates = driver.find_elements(
+                        By.CSS_SELECTOR,
+                        "input[type='tel'], input[type='text'], input[type='number'], input[name*='code' i]",
                     )
-                    code_input.clear()
-                    code_input.send_keys(reply.strip())
-                    code_input.send_keys(Keys.ENTER)
+                    for code_input in candidates:
+                        if not code_input.is_displayed() or not code_input.is_enabled():
+                            continue
+                        code_input.clear()
+                        code_input.send_keys(reply.strip())
+                        code_input.send_keys(Keys.ENTER)
+                        break
                 except Exception:  # noqa: BLE001
                     pass
+            await asyncio.sleep(4)
 
         await asyncio.sleep(3)
 
