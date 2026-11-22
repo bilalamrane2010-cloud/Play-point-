@@ -209,6 +209,7 @@ def add_account(
         "password": password.strip(),
         "auth_type": auth_type,
         "logged_in": False,
+        "cookies": [],
         "profile_dir": os.path.join(PROFILES_DIR, prof_slug),
         "device_name": device_name.strip() or base_dev["device_name"],
         "device_id": device_id.strip() or f"DEV-{random.randint(100000, 999999)}",
@@ -222,7 +223,7 @@ def add_account(
         "identity_updated_at": time.time(),
         "added_at": time.time(),
         "sent": 0,
-        "last_status": "New",
+        "last_status": "جديد",
     })
     save_accounts(accounts)
     return True
@@ -245,6 +246,36 @@ def update_account(email, **kwargs):
             save_accounts(accounts)
             return True
     return False
+
+
+def import_cookies_for_account(email, raw_json_str):
+    try:
+        parsed = json.loads(raw_json_str)
+        if isinstance(parsed, dict) and "cookies" in parsed:
+            parsed = parsed["cookies"]
+        if not isinstance(parsed, list) or not parsed:
+            return False, "صيغة الكوكيز غير صالحة"
+        cleaned = []
+        for c in parsed:
+            if not isinstance(c, dict) or not c.get("name") or not c.get("value"):
+                continue
+            item = {
+                "name": str(c["name"]),
+                "value": str(c["value"]),
+                "domain": str(c.get("domain") or ".google.com"),
+                "path": str(c.get("path") or "/"),
+            }
+            if c.get("secure") is not None:
+                item["secure"] = bool(c["secure"])
+            if c.get("httpOnly") is not None:
+                item["httpOnly"] = bool(c["httpOnly"])
+            cleaned.append(item)
+        if not cleaned:
+            return False, "لا توجد كوكيز صالحة داخل الملف"
+        ok = update_account(email, cookies=cleaned, logged_in=True, last_status="جلسة مستوردة ✅")
+        return (True, f"تم استيراد {len(cleaned)} كوكيز بنجاح") if ok else (False, "الحساب غير موجود")
+    except Exception as e:
+        return False, f"خطأ في قراءة JSON: {_format_exc(e)}"
 
 
 def load_settings():
@@ -374,8 +405,7 @@ async def generate_report():
     client, model = _get_ai_client_and_model()
 
     if not client:
-        parts = template.split("
-", 1)
+        parts = template.split("\n", 1)
         subject = parts[0].replace("Subject:", "").strip()
         body = parts[1].strip() if len(parts) > 1 else template
         return {"subject": subject, "body": body}
@@ -388,19 +418,11 @@ async def generate_report():
         "3) Confirming sole ownership of the account and that all points and transactions were earned legitimately under Google Play Terms of Service with no violations. "
         "4) Politely asking to review and reinstate Play Points access. "
         "STRICT RULES: Do NOT add new facts, apologies, promises, order IDs, dates, amounts, personal details, or outside topics. "
-        "Do NOT omit the core appeal points. Output in English only.
-
-"
-        f"ORIGINAL TEXT:
-{template}
-
-"
-        "Return strictly in this format:
-"
-        "SUBJECT: <rephrased subject>
-"
-        "BODY:
-<rephrased body>"
+        "Do NOT omit the core appeal points. Output in English only.\n\n"
+        f"ORIGINAL TEXT:\n{template}\n\n"
+        "Return strictly in this format:\n"
+        "SUBJECT: <rephrased subject>\n"
+        "BODY:\n<rephrased body>"
     )
     try:
         resp = await client.chat.completions.create(
@@ -417,14 +439,12 @@ async def generate_report():
             if line.upper().startswith("SUBJECT:"):
                 subject = line.split(":", 1)[1].strip()
             elif line.upper().startswith("BODY:"):
-                body = "
-".join(lines[i + 1:]).strip()
+                body = "\n".join(lines[i + 1:]).strip()
                 break
         return {"subject": subject, "body": body}
     except Exception as e:
         logging.error(f"AI report generation failed: {_format_exc(e)}")
-        parts = template.split("
-", 1)
+        parts = template.split("\n", 1)
         subject = parts[0].replace("Subject:", "").strip()
         body = parts[1].strip() if len(parts) > 1 else template
         return {"subject": subject, "body": body}
@@ -527,7 +547,7 @@ def _clean_stale_profile_locks(prof_dir):
 def _cleanup_stray_browser_processes():
     try:
         subprocess.run(
-            ["pkill", "-9", "-f", "chromium.*--headless"],
+            ["pkill", "-9", "-f", "chromium|chrome"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=2,
@@ -548,6 +568,52 @@ def _get_proxy_url():
         if val:
             return val
     return ""
+
+
+def _inject_saved_cookies(driver, account):
+    cookies = account.get("cookies") or []
+    if not cookies:
+        return False
+    try:
+        driver.get("https://accounts.google.com/robots.txt")
+        time.sleep(0.5)
+        injected = 0
+        for c in cookies:
+            cookie_dict = {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c.get("domain", ".google.com"),
+                "path": c.get("path", "/"),
+            }
+            try:
+                driver.add_cookie(cookie_dict)
+                injected += 1
+            except Exception:
+                pass
+        return injected > 0
+    except Exception:
+        return False
+
+
+def _save_driver_cookies(driver, account):
+    try:
+        raw_cookies = driver.get_cookies() or []
+        google_cookies = [
+            {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c.get("domain", ".google.com"),
+                "path": c.get("path", "/"),
+                "secure": bool(c.get("secure", True)),
+                "httpOnly": bool(c.get("httpOnly", False)),
+            }
+            for c in raw_cookies
+            if "google" in (c.get("domain") or "")
+        ]
+        if google_cookies:
+            update_account(account["email"], cookies=google_cookies)
+    except Exception:
+        pass
 
 
 def _build_chrome_driver(account):
@@ -577,6 +643,38 @@ def _build_chrome_driver(account):
     ip_addr = account.get("ip_address") or "105.104.22.14"
     proxy_url = _get_proxy_url()
 
+    low_mem_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-software-rasterizer",
+        "--disable-features=VizDisplayCompositor,IsolateOrigins,site-per-process,Translate,BackForwardCache",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-backgrounding-occluded-windows",
+        "--disable-breakpad",
+        "--disable-extensions",
+        "--disable-sync",
+        "--disable-default-apps",
+        "--disable-component-update",
+        "--disable-domain-reliability",
+        "--disable-client-side-phishing-detection",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--renderer-process-limit=1",
+        "--disk-cache-size=16777216",
+        "--media-cache-size=8388608",
+        "--metrics-recording-only",
+        "--mute-audio",
+        "--js-flags=--max-old-space-size=256",
+        f"--window-size={width},{height}",
+        f"--lang={locale}",
+        f"--user-agent={ua}",
+    ]
+    if proxy_url:
+        low_mem_args.append(f"--proxy-server={proxy_url}")
+
     major_ver = _detect_chrome_major_version(chrome_bin)
     driver = None
 
@@ -587,26 +685,8 @@ def _build_chrome_driver(account):
         uc_opts.binary_location = chrome_bin
         uc_opts.user_data_dir = prof_dir
         uc_opts.add_argument("--profile-directory=Default")
-        uc_opts.add_argument("--no-sandbox")
-        uc_opts.add_argument("--disable-dev-shm-usage")
-        uc_opts.add_argument("--disable-gpu")
-        uc_opts.add_argument("--disable-software-rasterizer")
-        uc_opts.add_argument("--disable-features=VizDisplayCompositor,IsolateOrigins,site-per-process")
-        uc_opts.add_argument("--disable-background-networking")
-        uc_opts.add_argument("--disable-background-timer-throttling")
-        uc_opts.add_argument("--disable-renderer-backgrounding")
-        uc_opts.add_argument("--disable-backgrounding-occluded-windows")
-        uc_opts.add_argument("--disable-breakpad")
-        uc_opts.add_argument("--disable-extensions")
-        uc_opts.add_argument("--disable-sync")
-        uc_opts.add_argument("--metrics-recording-only")
-        uc_opts.add_argument("--mute-audio")
-        uc_opts.add_argument("--js-flags=--max-old-space-size=384")
-        uc_opts.add_argument(f"--window-size={width},{height}")
-        uc_opts.add_argument(f"--lang={locale}")
-        uc_opts.add_argument(f"--user-agent={ua}")
-        if proxy_url:
-            uc_opts.add_argument(f"--proxy-server={proxy_url}")
+        for arg in low_mem_args:
+            uc_opts.add_argument(arg)
 
         uc_kwargs = {
             "options": uc_opts,
@@ -628,30 +708,12 @@ def _build_chrome_driver(account):
         opts.add_argument("--disable-blink-features=AutomationControlled")
         opts.add_experimental_option("excludeSwitches", ["enable-automation"])
         opts.add_experimental_option("useAutomationExtension", False)
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--disable-software-rasterizer")
-        opts.add_argument("--disable-features=VizDisplayCompositor,IsolateOrigins,site-per-process")
-        opts.add_argument("--disable-background-networking")
-        opts.add_argument("--disable-background-timer-throttling")
-        opts.add_argument("--disable-renderer-backgrounding")
-        opts.add_argument("--disable-backgrounding-occluded-windows")
-        opts.add_argument("--disable-breakpad")
-        opts.add_argument("--disable-extensions")
-        opts.add_argument("--disable-sync")
-        opts.add_argument("--metrics-recording-only")
-        opts.add_argument("--mute-audio")
-        opts.add_argument("--js-flags=--max-old-space-size=384")
         opts.add_argument("--remote-debugging-pipe")
         opts.add_argument("--headless=new")
-        opts.add_argument(f"--window-size={width},{height}")
-        opts.add_argument(f"--lang={locale}")
-        opts.add_argument(f"--user-agent={ua}")
         opts.add_argument(f"--user-data-dir={prof_dir}")
         opts.add_argument("--profile-directory=Default")
-        if proxy_url:
-            opts.add_argument(f"--proxy-server={proxy_url}")
+        for arg in low_mem_args:
+            opts.add_argument(arg)
 
         driver_path = _resolve_chromedriver_path()
         driver = webdriver.Chrome(service=Service(driver_path), options=opts)
@@ -665,6 +727,8 @@ def _build_chrome_driver(account):
                 "source": f"""
                     Object.defineProperty(navigator, 'webdriver', {{get: () => undefined}});
                     Object.defineProperty(navigator, 'platform', {{get: () => 'Linux armv8l'}});
+                    Object.defineProperty(navigator, 'hardwareConcurrency', {{get: () => 8}});
+                    Object.defineProperty(navigator, 'deviceMemory', {{get: () => 8}});
                     window.__DEVICE_IDENTITY__ = {{
                         deviceName: {json.dumps(dev_name)},
                         deviceId: {json.dumps(dev_id)},
@@ -681,6 +745,25 @@ def _build_chrome_driver(account):
                 "height": height,
                 "deviceScaleFactor": 2.625,
                 "mobile": True,
+            },
+        )
+        driver.execute_cdp_cmd("Network.enable", {})
+        driver.execute_cdp_cmd(
+            "Network.setBlockedURLs",
+            {
+                "urls": [
+                    "*.png",
+                    "*.jpg",
+                    "*.jpeg",
+                    "*.gif",
+                    "*.webp",
+                    "*.mp4",
+                    "*.woff",
+                    "*.woff2",
+                    "*doubleclick.net*",
+                    "*google-analytics.com*",
+                    "*googletagmanager.com*",
+                ]
             },
         )
     except Exception:
@@ -724,6 +807,7 @@ def _is_insecure_browser_block(driver):
             "couldn't sign you in" in txt
             or "this browser or app may not be secure" in txt
             or "browser or app may not be secure" in txt
+            or "try using a different browser" in txt
         )
     except Exception:
         return False
@@ -844,17 +928,20 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
     except Exception:
         pass
 
+    _inject_saved_cookies(driver, account)
+
     driver.get("https://myaccount.google.com/?hl=en")
     await asyncio.sleep(1.5)
     _close_extra_tabs(driver)
 
     if "myaccount.google.com" in driver.current_url and "signin" not in driver.current_url:
+        _save_driver_cookies(driver, account)
         extract_and_save_profile_names(driver, account)
-        update_account(account["email"], logged_in=True, last_status="Session active")
+        update_account(account["email"], logged_in=True, last_status="جلسة نشطة ✅")
         return True, "Logged in"
 
     if _is_insecure_browser_block(driver):
-        update_account(account["email"], logged_in=False, last_status="Browser sign-in blocked")
+        update_account(account["email"], logged_in=False, last_status="محظور من المتصفح")
         return False, "Browser sign-in blocked by Google"
 
     driver.get("https://accounts.google.com/signin/v2/identifier?hl=en")
@@ -873,7 +960,7 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         return False, f"Failed to enter email: {_format_exc(e)}"
 
     if _is_insecure_browser_block(driver):
-        update_account(account["email"], logged_in=False, last_status="Browser sign-in blocked")
+        update_account(account["email"], logged_in=False, last_status="محظور من المتصفح")
         return False, "Browser sign-in blocked by Google"
 
     if _has_real_captcha_challenge(driver) and challenge_callback:
@@ -938,7 +1025,7 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
         if _is_insecure_browser_block(driver):
             if challenge_task and not challenge_task.done():
                 challenge_task.cancel()
-            update_account(account["email"], logged_in=False, last_status="Browser sign-in blocked")
+            update_account(account["email"], logged_in=False, last_status="محظور من المتصفح")
             return False, "Browser sign-in blocked by Google"
 
         cur = driver.current_url or ""
@@ -950,8 +1037,9 @@ async def _interactive_google_login(driver, account, challenge_callback=None, ti
             if challenge_task and not challenge_task.done():
                 challenge_task.cancel()
             await asyncio.sleep(0.6)
+            _save_driver_cookies(driver, account)
             extract_and_save_profile_names(driver, account)
-            update_account(account["email"], logged_in=True, last_status="Session active")
+            update_account(account["email"], logged_in=True, last_status="جلسة نشطة ✅")
             return True, "Logged in"
 
         if "challenge" in cur and not notified_2fa and challenge_callback:
@@ -1007,15 +1095,11 @@ async def analyze_gethelp_step_with_ai(step_summary, available_actions, body_tex
         "You have NO freedom to invent actions or change the appeal topic. "
         "Allowed actions: 'type_issue', 'select_chip', 'select_area', 'click_next', 'select_email', 'fill_form', 'submit'. "
         "Stick strictly to the Play Points restriction appeal points (traveling abroad, Wi-Fi/location changes causing false-positive suspicious activity flag, legitimate earned points, manual review request). "
-        f"Current step context: {step_summary}
-"
-        f"Visible elements/options: {available_actions}
-"
-        f"First Name: {first_name} | Last Name: {last_name}
-"
-        f"Appeal Body: {body_text}
-"
-        "Reply ONLY as compact JSON: {"action": "...", "target_text": "...", "input_value": "..."}"
+        f"Current step context: {step_summary}\n"
+        f"Visible elements/options: {available_actions}\n"
+        f"First Name: {first_name} | Last Name: {last_name}\n"
+        f"Appeal Body: {body_text}\n"
+        'Reply ONLY as compact JSON: {"action": "...", "target_text": "...", "input_value": "..."}'
     )
     try:
         resp = await client.chat.completions.create(
@@ -1085,7 +1169,7 @@ async def _run_gethelp_form_once(driver, account, body_text, first_name, last_na
             pass
         return out
 
-    def _wait_any_form_control(timeout=7):
+    def _wait_any_form_control(timeout=10):
         try:
             return WebDriverWait(driver, timeout).until(
                 lambda d: any(
@@ -1137,7 +1221,7 @@ async def _run_gethelp_form_once(driver, account, body_text, first_name, last_na
         raise RuntimeError("Browser sign-in blocked by Google")
 
     try:
-        vis_inputs = WebDriverWait(driver, 10).until(
+        vis_inputs = WebDriverWait(driver, 12).until(
             lambda d: [
                 el for el in d.find_elements(By.CSS_SELECTOR, "input[type='text'], input:not([type])")
                 if el.is_displayed() and el.is_enabled()
@@ -1170,11 +1254,11 @@ async def _run_gethelp_form_once(driver, account, body_text, first_name, last_na
             break
 
     _click_by_texts(["email", "البريد الإلكتروني"])
-    _wait_any_form_control(timeout=7)
+    _wait_any_form_control(timeout=10)
 
     if not _visible_elements("textarea") and not _visible_elements("input[type='text']"):
         _click_by_texts(["next step", "الخطوة التالية", "next", "التالي"])
-        _wait_any_form_control(timeout=7)
+        _wait_any_form_control(timeout=10)
 
     for e_inp in _visible_elements("input[type='email']"):
         if not (e_inp.get_attribute("value") or "").strip():
@@ -1188,7 +1272,9 @@ async def _run_gethelp_form_once(driver, account, body_text, first_name, last_na
             parent_txt = (inp.find_element(By.XPATH, "./ancestor::*[self::div or self::section][1]").text or "").lower()
         except Exception:
             pass
-        if "transaction id" in parent_txt or "order id" in parent_txt:
+        aria_lbl = (inp.get_attribute("aria-label") or inp.get_attribute("placeholder") or "").lower()
+        combined_lbl = f"{parent_txt} {aria_lbl}"
+        if "transaction id" in combined_lbl or "order id" in combined_lbl or "gpa." in combined_lbl:
             _safe_type(inp, "N/A")
         elif idx == 0 and not cur_val:
             _safe_type(inp, first_name)
@@ -1253,7 +1339,7 @@ async def _run_gethelp_form_once(driver, account, body_text, first_name, last_na
         raise RuntimeError("Submit button not found on GetHelp form")
 
     try:
-        WebDriverWait(driver, 8).until(
+        WebDriverWait(driver, 10).until(
             lambda d: any(
                 phrase in (d.page_source or "").lower()
                 for phrase in (
@@ -1403,11 +1489,11 @@ async def dispatch_report(account, subject, body, method="auto", challenge_callb
             return True, info, "gmail_web"
         return _try_smtp_fallback(info)
 
-    if account.get("logged_in") or account.get("password"):
+    if account.get("logged_in") or account.get("password") or account.get("cookies"):
         ok, info = await send_via_gethelp_form(account, body, challenge_callback)
         if ok:
             return True, info, "web_form"
-        if has_smtp:
+        if allow_smtp_fallback and has_smtp:
             s_ok, s_info = send_via_smtp(account, target_email, subject, body)
             if s_ok:
                 return True, s_info, "smtp"
@@ -1417,4 +1503,4 @@ async def dispatch_report(account, subject, body, method="auto", challenge_callb
         ok, info = send_via_smtp(account, target_email, subject, body)
         return ok, info, "smtp"
 
-    return False, "No valid credentials", method
+    return False, "لا توجد بيانات دخول صالحة للحساب", method

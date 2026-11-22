@@ -1,5 +1,4 @@
 import asyncio
-import json
 import logging
 import os
 import random
@@ -56,20 +55,13 @@ def render_dashboard():
         "gmail_web": "ويب Gmail",
     }
     return (
-        "🛡️ لوحة التحكم
-"
-        "━━━━━━━━━━━━━━
-"
-        f"• الحسابات: {len(accounts)}
-"
-        f"• الإرسال التلقائي: {'مفعّل ✅' if s.get('auto_send_enabled') else 'متوقف ⏸️'}
-"
-        f"• كل: {s.get('auto_send_interval', 60)} دقيقة
-"
-        f"• الطريقة: {method_labels.get(s.get('send_method', 'auto'), 'تلقائي ذكي')}
-"
-        f"• تم الإرسال: {st.get('total_sent', 0)} | فشل: {st.get('failed', 0)}
-"
+        "🛡️ لوحة التحكم\n"
+        "━━━━━━━━━━━━━━\n"
+        f"• الحسابات: {len(accounts)}\n"
+        f"• الإرسال التلقائي: {'مفعّل ✅' if s.get('auto_send_enabled') else 'متوقف ⏸️'}\n"
+        f"• كل: {s.get('auto_send_interval', 60)} دقيقة\n"
+        f"• الطريقة: {method_labels.get(s.get('send_method', 'auto'), 'تلقائي ذكي')}\n"
+        f"• تم الإرسال: {st.get('total_sent', 0)} | فشل: {st.get('failed', 0)}\n"
         "━━━━━━━━━━━━━━"
     )
 
@@ -106,9 +98,7 @@ async def send_challenge_to_telegram(bot, chat_id, email, challenge_type, screen
         [InlineKeyboardButton("✅ تم التأكيد", callback_data=f"ch_done::{email}")],
         [InlineKeyboardButton("❌ إلغاء", callback_data=f"ch_cancel::{email}")],
     ])
-    caption_str = f"🔐 تحقق مطلوب للحساب: {email}
-
-{prompt_text}"
+    caption_str = f"🔐 تحقق مطلوب للحساب: {email}\n\n{prompt_text}"
     sent_photo = False
     if screenshot_path and os.path.exists(screenshot_path):
         try:
@@ -236,9 +226,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ],
             [
                 InlineKeyboardButton("🔐 تسجيل دخول", callback_data="acc_login_select"),
-                InlineKeyboardButton("🧪 فحص البريد", callback_data="acc_test_select"),
+                InlineKeyboardButton("🍪 استيراد كوكيز", callback_data="acc_cookies_select"),
             ],
             [
+                InlineKeyboardButton("🧪 فحص البريد", callback_data="acc_test_select"),
                 InlineKeyboardButton("🔙 رجوع", callback_data="back_main"),
             ],
         ]
@@ -277,23 +268,19 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         blocks = []
         for a in accounts:
             blocks.append(
-                f"• {a['email']}
-"
+                f"• {a['email']}\n"
                 f"  الحالة: {a.get('last_status', 'جديد')} | المرسل: {a.get('sent', 0)}"
             )
-        text = "
-
-".join(blocks)
+        text = "\n\n".join(blocks)
         if len(text) > 3900:
-            text = text[:3900] + "
-..."
+            text = text[:3900] + "\n..."
         await q.edit_message_text(
             text,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")]]),
         )
         return
 
-    if data in ("acc_edit_select", "acc_del_select", "acc_login_select", "acc_test_select"):
+    if data in ("acc_edit_select", "acc_del_select", "acc_login_select", "acc_test_select", "acc_cookies_select"):
         accounts = core.load_accounts()
         if not accounts:
             await q.edit_message_text(
@@ -306,11 +293,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "acc_del_select": "acc_del_confirm",
             "acc_login_select": "acc_login_run",
             "acc_test_select": "acc_test_run",
+            "acc_cookies_select": "acc_cookies_prompt",
         }
         prefix = prefix_map[data]
         kb = [[InlineKeyboardButton(a["email"], callback_data=f"{prefix}::{a['email']}")] for a in accounts]
         kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")])
         await q.edit_message_text("اختر الحساب:", reply_markup=InlineKeyboardMarkup(kb))
+        return
+
+    if data.startswith("acc_cookies_prompt::"):
+        email = data.split("::", 1)[1]
+        USER_STATES[chat_id] = {"step": "import_cookies", "email": email}
+        await q.edit_message_text(
+            f"🍪 أرسل كوكيز الحساب ({email}) بصيغة JSON أو ارفع ملف .json أو /cancel:"
+        )
         return
 
     if data.startswith("acc_edit_menu::"):
@@ -370,8 +366,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             res = "غير مضبوط"
         await q.edit_message_text(
-            f"🧪 نتيجة الفحص ({email}):
-• البريد المباشر: {res}",
+            f"🧪 نتيجة الفحص ({email}):\n• البريد المباشر: {res}",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="menu_accounts")]]),
         )
         return
@@ -433,18 +428,38 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📊 إحصائيات الإرسال",
             f"• ناجح: {st.get('total_sent', 0)}",
             f"• فاشل: {st.get('failed', 0)}",
-            "
-آخر العمليات:",
+            "\nآخر العمليات:",
         ]
         for h in reversed(st.get("history", [])[-10:]):
             icon = "✅" if h["success"] else "❌"
             lines.append(f"{icon} {h['email']}")
         await q.edit_message_text(
-            "
-".join(lines),
+            "\n".join(lines),
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 رجوع", callback_data="back_main")]]),
         )
         return
+
+
+async def document_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = USER_STATES.get(chat_id)
+    if not state or state.get("step") != "import_cookies":
+        return
+    doc = update.message.document
+    if not doc:
+        return
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        raw_bytes = await tg_file.download_as_bytearray()
+        raw_text = raw_bytes.decode("utf-8", errors="replace")
+        ok, msg = core.import_cookies_for_account(state["email"], raw_text)
+        USER_STATES.pop(chat_id, None)
+        await update.message.reply_text(
+            f"{'✅' if ok else '❌'} {msg}",
+            reply_markup=build_main_menu(),
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ تعذر قراءة الملف: {core._format_exc(e)}")
 
 
 async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -467,6 +482,15 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     step = state["step"]
+
+    if step == "import_cookies":
+        ok, msg = core.import_cookies_for_account(state["email"], text)
+        USER_STATES.pop(chat_id, None)
+        await update.message.reply_text(
+            f"{'✅' if ok else '❌'} {msg}",
+            reply_markup=build_main_menu(),
+        )
+        return
 
     if step == "add_email":
         if "@" not in text or "." not in text:
@@ -618,18 +642,15 @@ async def execute_report_task(bot, chat_id, account, force_method=None):
         core.update_account(account["email"], sent=account.get("sent", 0) + 1, last_status="تم الإرسال ✅")
         await bot.send_message(
             chat_id,
-            f"✅ تم إرسال البلاغ بنجاح
-"
-            f"• الحساب: {account['email']}
-"
+            f"✅ تم إرسال البلاغ بنجاح\n"
+            f"• الحساب: {account['email']}\n"
             f"• العنوان: {report['subject']}",
         )
     else:
         core.update_account(account["email"], last_status="فشل الإرسال ❌")
         await bot.send_message(
             chat_id,
-            f"❌ فشل إرسال البلاغ ({account['email']})
-السبب: {info}",
+            f"❌ فشل إرسال البلاغ ({account['email']})\nالسبب: {info}",
         )
 
 
@@ -659,7 +680,7 @@ async def auto_scheduler_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 def main():
-    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "9204455871:AAGTPgz2d086vZCYlFkrcDCci7DWr6un9oY").strip()
+    token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:
         raise ValueError("TELEGRAM_BOT_TOKEN missing")
 
@@ -667,6 +688,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
     app.add_handler(CallbackQueryHandler(callback_router))
+    app.add_handler(MessageHandler(filters.Document.ALL, document_input_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input_handler))
     app.job_queue.run_repeating(auto_scheduler_job, interval=20, first=10)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
