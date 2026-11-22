@@ -700,6 +700,28 @@ def _build_smtp_message(sender_email: str, sender_name: str, to_email: str, subj
     return message
 
 
+def _friendly_smtp_error(exc: Exception) -> str:
+    """Translate raw smtplib failures into an actionable message."""
+    if isinstance(exc, smtplib.SMTPAuthenticationError):
+        return (
+            "535 5.7.8 اسم المستخدم أو كلمة المرور غير مقبولة. "
+            "Gmail لا يقبل كلمة مرور الحساب عبر SMTP — يجب إنشاء App Password "
+            "من 16 حرفاً من myaccount.google.com/apppasswords ثم لصقها هنا."
+        )
+    if isinstance(exc, smtplib.SMTPServerDisconnected):
+        # Gmail drops the socket right after a failed AUTH, so a bad password
+        # often surfaces as a disconnect instead of a 535.
+        return (
+            "انقطع الاتصال أثناء تسجيل الدخول — غالباً كلمة المرور مرفوضة (535). "
+            "استخدم App Password من 16 حرفاً من myaccount.google.com/apppasswords."
+        )
+    if isinstance(exc, smtplib.SMTPRecipientsRefused):
+        return f"عنوان المستلم مرفوض: {exc.recipients}"
+    if isinstance(exc, smtplib.SMTPSenderRefused):
+        return f"عنوان المرسل مرفوض: {exc.sender}"
+    return _format_exc(exc)
+
+
 def _smtp_attempt(config: dict, sender_email: str, app_pw: str, to_email: str, message: MIMEMultipart) -> tuple[bool, str]:
     security = config["security"]
     if security == "ssl":
@@ -720,8 +742,11 @@ def _smtp_login_and_send(sender_email: str, app_pw: str, to_email: str, message:
     config = _smtp_config()
     try:
         return _smtp_attempt(config, sender_email, app_pw, to_email, message)
+    except (smtplib.SMTPAuthenticationError, smtplib.SMTPServerDisconnected) as exc:
+        # Never retry a second port for bad credentials: it only doubles the wait.
+        return False, _friendly_smtp_error(exc)
     except Exception as exc:  # noqa: BLE001
-        last_error = _format_exc(exc)
+        last_error = _friendly_smtp_error(exc)
 
     # Only fall back to Gmail's alternate port when we are actually talking to Gmail.
     if config["host"].lower().endswith("gmail.com") and config["port"] != 465:
@@ -729,30 +754,213 @@ def _smtp_login_and_send(sender_email: str, app_pw: str, to_email: str, message:
         try:
             return _smtp_attempt(alt, sender_email, app_pw, to_email, message)
         except Exception as exc:  # noqa: BLE001
-            return False, f"SMTP {config['port']}: {last_error} | SMTP 465: {_format_exc(exc)}"
+            return False, f"SMTP {config['port']}: {last_error} | SMTP 465: {_friendly_smtp_error(exc)}"
     return False, f"SMTP {config['port']}: {last_error}"
 
 
-def send_via_smtp(account: dict, to_email: str, subject: str, body: str) -> tuple[bool, str]:
-    app_pw = (account.get("app_password") or "").replace(" ", "").strip()
-    if not app_pw:
-        return False, "Missing App Password"
+# ---------------------------------------------------------------------------
+# HTTPS email transports (Railway blocks outbound SMTP on 25/465/587)
+# ---------------------------------------------------------------------------
+
+def _email_transport() -> str:
+    """Return the configured transport: auto | smtp | brevo | resend | apps_script."""
+    return (os.getenv("EMAIL_TRANSPORT", "auto").strip().lower() or "auto")
+
+
+def _https_email_providers() -> dict:
+    return {
+        "brevo": (os.getenv("BREVO_API_KEY", "") or "").strip(),
+        "resend": (os.getenv("RESEND_API_KEY", "") or "").strip(),
+        "apps_script": (os.getenv("APPS_SCRIPT_URL", "") or "").strip(),
+    }
+
+
+def _post_json(url: str, payload: dict, headers: Optional[dict] = None, timeout: int = 25) -> tuple[bool, str]:
+    """POST a JSON body over HTTPS using only the standard library."""
+    import urllib.error
+    import urllib.request
+
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, method="POST")
+    request.add_header("Content-Type", "application/json")
+    request.add_header("Accept", "application/json")
+    for key, value in (headers or {}).items():
+        request.add_header(key, value)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8", "replace")
+            return True, f"HTTP {response.status}: {body[:300]}"
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:  # noqa: BLE001
+            pass
+        return False, f"HTTP {exc.code}: {detail or exc.reason}"
+    except Exception as exc:  # noqa: BLE001
+        return False, _format_exc(exc)
+
+
+def _send_via_apps_script(url: str, sender_email: str, sender_name: str, to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    """Send through a Google Apps Script web app (uses the owner's own Gmail)."""
+    payload = {
+        "to": to_email,
+        "subject": subject,
+        "body": body,
+        "from_email": sender_email,
+        "from_name": sender_name,
+        "secret": (os.getenv("APPS_SCRIPT_SECRET", "") or "").strip(),
+    }
+    ok, info = _post_json(url, payload)
+    if ok and '"ok"' not in info.lower() and "success" not in info.lower():
+        # Apps Script always answers 200; inspect the JSON payload for real status.
+        if '"error"' in info.lower():
+            return False, f"Apps Script error: {info}"
+    return ok, f"Apps Script: {info}"
+
+
+def _send_via_brevo(api_key: str, sender_email: str, sender_name: str, to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    payload = {
+        "sender": {"email": sender_email, "name": sender_name},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "textContent": body,
+    }
+    ok, info = _post_json("https://api.brevo.com/v3/smtp/email", payload, {"api-key": api_key})
+    return ok, f"Brevo: {info}"
+
+
+def _send_via_resend(api_key: str, sender_email: str, sender_name: str, to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    payload = {
+        "from": f"{sender_name} <{sender_email}>" if sender_name else sender_email,
+        "to": [to_email],
+        "subject": subject,
+        "text": body,
+    }
+    ok, info = _post_json(
+        "https://api.resend.com/emails",
+        payload,
+        {"Authorization": f"Bearer {api_key}"},
+    )
+    return ok, f"Resend: {info}"
+
+
+def _send_via_https(account: dict, to_email: str, subject: str, body: str, provider: str = "") -> tuple[bool, str]:
+    sender_email = (account.get("email") or "").strip()
+    sender_name = f"{account.get('first_name', '')} {account.get('last_name', '')}".strip() or "Google Play User"
+    providers = _https_email_providers()
+    order = [provider] if provider else [p for p in ("apps_script", "brevo", "resend") if providers.get(p)]
+    if not order:
+        return False, "No HTTPS email provider configured (APPS_SCRIPT_URL / BREVO_API_KEY / RESEND_API_KEY)"
+    last = ""
+    for name in order:
+        if name == "apps_script" and providers["apps_script"]:
+            ok, info = _send_via_apps_script(providers["apps_script"], sender_email, sender_name, to_email, subject, body)
+        elif name == "brevo" and providers["brevo"]:
+            ok, info = _send_via_brevo(providers["brevo"], sender_email, sender_name, to_email, subject, body)
+        elif name == "resend" and providers["resend"]:
+            ok, info = _send_via_resend(providers["resend"], sender_email, sender_name, to_email, subject, body)
+        else:
+            continue
+        if ok:
+            return True, info
+        last = info
+        logging.warning("HTTPS email via %s failed: %s", name, info)
+    return False, last or "All HTTPS email providers failed"
+
+
+def _is_network_blocked(info: str) -> bool:
+    """True when the failure looks like an egress firewall rather than bad credentials."""
+    low = (info or "").lower()
+    markers = (
+        "network is unreachable",
+        "errno 101",
+        "connection refused",
+        "errno 111",
+        "timed out",
+        "timeout",
+        "temporary failure in name resolution",
+        "name or service not known",
+        "no route to host",
+    )
+    return any(marker in low for marker in markers)
+
+
+def send_email(account: dict, to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    """Send one email using the best available transport.
+
+    Railway (and most PaaS providers) block outbound SMTP on ports 25/465/587.
+    ``EMAIL_TRANSPORT=auto`` therefore tries SMTP first and, when the failure is
+    a network block rather than bad credentials, transparently retries over an
+    HTTPS provider (Google Apps Script, Brevo or Resend).
+    """
+    transport = _email_transport()
     sender_email = (account.get("email") or "").strip()
     if not is_valid_email(sender_email):
         return False, "Invalid sender email"
-    sender_name = f"{account.get('first_name', '')} {account.get('last_name', '')}".strip() or "Google Play User"
-    message = _build_smtp_message(sender_email, sender_name, to_email, subject, body)
-    ok, info = _smtp_login_and_send(sender_email, app_pw, to_email, message)
-    if not ok:
+
+    if transport in ("brevo", "resend", "apps_script"):
+        return _send_via_https(account, to_email, subject, body, provider=transport)
+
+    app_pw = (account.get("app_password") or "").replace(" ", "").strip()
+    smtp_error = ""
+    if app_pw:
+        sender_name = f"{account.get('first_name', '')} {account.get('last_name', '')}".strip() or "Google Play User"
+        message = _build_smtp_message(sender_email, sender_name, to_email, subject, body)
+        ok, info = _smtp_login_and_send(sender_email, app_pw, to_email, message)
+        if ok:
+            return True, info
+        smtp_error = info
         logging.error("SMTP error for %s: %s", sender_email, info)
-    return ok, info
+
+    if transport == "smtp":
+        return False, smtp_error or "Missing App Password"
+
+    providers = _https_email_providers()
+    if any(providers.values()):
+        if not smtp_error or _is_network_blocked(smtp_error):
+            ok, info = _send_via_https(account, to_email, subject, body)
+            if ok:
+                return True, info
+            return False, f"{smtp_error} | {info}" if smtp_error else info
+
+    if smtp_error:
+        if _is_network_blocked(smtp_error):
+            return False, (
+                f"{smtp_error} | منصة الاستضافة تحجب منافذ SMTP (25/465/587). "
+                "أضف APPS_SCRIPT_URL أو BREVO_API_KEY في متغيرات البيئة لتفعيل الإرسال عبر HTTPS."
+            )
+        return False, smtp_error
+    return False, "Missing App Password"
+
+
+def send_via_smtp(account: dict, to_email: str, subject: str, body: str) -> tuple[bool, str]:
+    """Backwards-compatible alias that now routes through :func:`send_email`."""
+    return send_email(account, to_email, subject, body)
 
 
 def test_smtp(account: dict) -> tuple[bool, str]:
+    sender_email = (account.get("email") or "").strip()
+    transport = _email_transport()
+    providers = _https_email_providers()
+
+    # HTTPS-only transports do not need an App Password at all.
+    if transport in ("brevo", "resend", "apps_script") or (
+        transport == "auto" and not (account.get("app_password") or "").strip() and any(providers.values())
+    ):
+        if not any(providers.values()):
+            return False, "No HTTPS email provider configured"
+        ok, info = _send_via_https(
+            account,
+            sender_email,
+            "Play-point connection test",
+            "This is an automatic connectivity test from the Play-point bot.",
+        )
+        return ok, info
+
     app_pw = (account.get("app_password") or "").replace(" ", "").strip()
     if not app_pw:
         return False, "Missing App Password"
-    sender_email = (account.get("email") or "").strip()
     config = _smtp_config()
     try:
         if config["security"] == "ssl":
@@ -767,7 +975,7 @@ def test_smtp(account: dict) -> tuple[bool, str]:
             server.login(sender_email, app_pw)
         return True, f"SMTP connection OK ({config['host']}:{config['port']} {config['security']})"
     except Exception as exc:  # noqa: BLE001
-        return False, _format_exc(exc)
+        return False, _friendly_smtp_error(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -870,6 +1078,22 @@ def _build_chrome_driver(account: dict):
     options.add_argument("--no-first-run")
     options.add_argument("--disable-notifications")
     options.add_argument("--disable-popup-blocking")
+    # Container/low-RAM hardening: without these Chromium's renderer gets
+    # OOM-killed on Railway ("WebDriverException: tab crashed").
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-background-networking")
+    options.add_argument("--disable-background-timer-throttling")
+    options.add_argument("--disable-backgrounding-occluded-windows")
+    options.add_argument("--disable-renderer-backgrounding")
+    options.add_argument("--disable-ipc-flooding-protection")
+    options.add_argument("--renderer-process-limit=1")
+    options.add_argument("--js-flags=--max-old-space-size=256")
+    options.add_argument("--memory-pressure-off")
+    options.add_argument("--disk-cache-size=33554432")
+    options.add_argument(
+        "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,"
+        "OptimizationHints,CalculateNativeWinOcclusion,InterestFeedContentSuggestions"
+    )
     if os.getenv("HEADLESS", "1").strip().lower() not in ("0", "false", "no"):
         options.add_argument("--headless=new")
     options.add_argument(f"--window-size={width},{height}")

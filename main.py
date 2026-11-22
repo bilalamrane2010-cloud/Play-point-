@@ -117,6 +117,19 @@ def build_main_menu() -> InlineKeyboardMarkup:
     )
 
 
+def _transport_label() -> str:
+    """Human-readable label for the active email transport."""
+    transport = core._email_transport()
+    providers = core._https_email_providers()
+    if transport in ("brevo", "resend", "apps_script"):
+        return f"{transport} (HTTPS) {'✅' if providers.get(transport) else '❌ غير مهيأ'}"
+    if transport == "smtp":
+        return "SMTP مباشر"
+    if any(providers.values()):
+        return "SMTP ثم HTTPS تلقائياً ✅"
+    return "SMTP فقط (قد يُحجب على Railway)"
+
+
 def render_dashboard() -> str:
     accounts = core.load_accounts()
     settings = core.load_settings()
@@ -135,6 +148,7 @@ def render_dashboard() -> str:
         f"• الإرسال القادم: {next_send}\n"
         f"• في الطابور: {queue_len}\n"
         f"• الطريقة: {METHOD_LABELS.get(settings.get('send_method', 'auto'), 'تلقائي ذكي')}\n"
+        f"• قناة البريد: {_transport_label()}\n"
         f"• تم الإرسال: {stats.get('total_sent', 0)} | فشل: {stats.get('failed', 0)}\n"
         "━━━━━━━━━━━━━━"
     )
@@ -279,7 +293,13 @@ async def run_one_send(bot, chat_id: Optional[int], account: dict) -> tuple[bool
         )
     else:
         core.update_account(account["email"], last_status="فشل الإرسال ❌")
-        message = f"❌ فشل إرسال البلاغ ({account['email']})\nالسبب: {info}"
+        hint = ""
+        if core._is_network_blocked(info):
+            hint = (
+                "\n\n💡 منصة الاستضافة تحجب منافذ SMTP. الحل: أضف APPS_SCRIPT_URL "
+                "(ملف google_apps_script.gs) في متغيرات البيئة وسيعمل الإرسال عبر HTTPS."
+            )
+        message = f"❌ فشل إرسال البلاغ ({account['email']})\nالسبب: {info}{hint}"
 
     targets = [chat_id] if chat_id is not None else list(NOTIFY_CHATS)
     for target in targets:
