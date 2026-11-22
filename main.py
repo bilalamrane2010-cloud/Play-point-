@@ -290,6 +290,33 @@ async def run_one_send(bot, chat_id: Optional[int], account: dict) -> tuple[bool
     return ok, info
 
 
+def _login_failure_hint(message: str) -> str:
+    """Return actionable Arabic guidance for a failed Google web login."""
+    low = (message or "").lower()
+    if "may not be secure" in low or "not trusted" in low or "blocked" in low:
+        return (
+            "\n\n💡 الحل الأفضل: استخدم «بريد + App Password» بدل تسجيل الدخول. "
+            "هذه الطريقة لا تحتاج تحقق Google وتعمل دائماً.\n"
+            "أنشئ App Password من: myaccount.google.com/apppasswords\n"
+            "ثم: الحسابات ← إضافة حساب ← بريد + App Password."
+        )
+    if "rejected" in low or "رفض" in message:
+        return (
+            "\n\n💡 أعد المحاولة وكن مستعداً: سيصل إشعار إلى هاتفك، اضغط Yes ثم الرقم الظاهر، "
+            "وبعدها اضغط زر «تم التأكيد» في تلغرام خلال دقيقتين."
+        )
+    if "cancelled" in low:
+        return (
+            "\n\n💡 ألغيت العملية. أعد المحاولة، وإذا ظهرت شاشة تحقق افتح الصورة، "
+            "أكمل التحقق من هاتفك، ثم اضغط «تم التأكيد»."
+        )
+    if "timeout" in low:
+        return "\n\n💡 انتهت المهلة. أعد المحاولة وأكمل التحقق من هاتفك بسرعة."
+    if "chromium" in low or "chrome" in low:
+        return "\n\n💡 المتصفح غير مثبت في الخادم. تأكد من بناء الصورة من Dockerfile المرفق."
+    return ""
+
+
 async def execute_login_only(bot, chat_id: int, account: dict) -> None:
     account = await core.ensure_account_session_identity(account)
     driver = None
@@ -302,7 +329,10 @@ async def execute_login_only(bot, chat_id: int, account: dict) -> None:
             core.extract_and_save_profile_names(driver, account)
             await bot.send_message(chat_id, f"✅ تم تسجيل الدخول بنجاح: {account['email']}")
         else:
-            await bot.send_message(chat_id, f"❌ تعذر تسجيل الدخول ({account['email']}): {message}")
+            hint = _login_failure_hint(message)
+            await bot.send_message(
+                chat_id, f"❌ تعذر تسجيل الدخول ({account['email']}): {message}{hint}"
+            )
     except Exception as exc:  # noqa: BLE001
         await bot.send_message(chat_id, f"❌ حدث خطأ: {core._format_exc(exc)}")
     finally:
